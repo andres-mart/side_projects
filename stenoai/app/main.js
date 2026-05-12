@@ -1,0 +1,5161 @@
+const { app, BrowserWindow, ipcMain, dialog, shell, systemPreferences, globalShortcut, safeStorage, Tray, Menu, nativeImage, Notification } = require('electron');
+
+// Prevent EPIPE crashes when stdout/stderr pipe is broken (e.g. launching terminal closed)
+process.stdout?.on('error', () => {});
+process.stderr?.on('error', () => {});
+const path = require('path');
+const { spawn, exec } = require('child_process');
+const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const os = require('os');
+const { URL, URLSearchParams } = require('url');
+const crypto = require('crypto');
+const { PostHog } = require('posthog-node');
+const { initMain } = require('electron-audio-loopback');
+const { autoUpdater } = require('electron-updater');
+
+// E2E test-harness hooks. Set via env vars; production sees none of these.
+//   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
+//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
+//   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
+if (process.env.STENOAI_USER_DATA_DIR) {
+  app.setPath('userData', process.env.STENOAI_USER_DATA_DIR);
+}
+const IS_E2E = process.env.STENOAI_E2E === '1';
+const IS_E2E_MOCK_IPC = process.env.STENOAI_E2E_MOCK_IPC === '1';
+if (IS_E2E_MOCK_IPC) {
+  require('./e2e-mock-ipc').install({ ipcMain, BrowserWindow });
+}
+
+// Initialize electron-audio-loopback before app is ready.
+// forceCoreAudioTap drives Chromium to use macOS 14.4+ CoreAudio Process Taps
+// (NSAudioCaptureUsageDescription) rather than ScreenCaptureKit. SCK was
+// returning silent right channels in our tests on macOS 26; CoreAudio Tap
+// matches Meetily's default and is the path our Info.plist + entitlements
+// are prepared for. Older macOS (< 14.4) is gated out at the UI layer.
+initMain({ forceCoreAudioTap: true });
+
+// CoreAudio Process Taps require macOS 14.4+. Returns false on non-macOS or
+// older versions so the renderer can disable the system-audio toggle rather
+// than silently producing dead-channel recordings.
+function isCoreAudioTapSupported() {
+  if (process.platform !== 'darwin') return false;
+  try {
+    const v = process.getSystemVersion();
+    const [maj, min = 0] = v.split('.').map((n) => parseInt(n, 10) || 0);
+    return maj > 14 || (maj === 14 && min >= 4);
+  } catch (_) {
+    return false;
+  }
+}
+
+let mainWindow;
+let pythonProcess;
+let tray = null;
+let isQuitting = false;
+// true once the window has been shown for the first time (React mounted).
+// Prevents activate/focus handlers from showing the window before it's ready.
+let windowReadyToShow = false;
+let shortcutQueue = [];
+let pendingShortcutUrls = [];
+let rendererShortcutReady = false;
+let launchedByShortcut = false;
+
+const SHORTCUT_PROTOCOL = 'stenoai';
+const SHORTCUT_HOST = 'record';
+const SHORTCUT_SESSION_NAME_MAX_LENGTH = 120;
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+
+function extractShortcutUrlFromArgv(argv = []) {
+  return argv.find(arg => typeof arg === 'string' && arg.startsWith(`${SHORTCUT_PROTOCOL}://`));
+}
+
+function sanitizeShortcutUrlForLogs(incomingUrl) {
+  try {
+    const parsed = new URL(incomingUrl);
+    return `${parsed.protocol}//${parsed.hostname}${parsed.pathname}`;
+  } catch (error) {
+    return '[invalid-shortcut-url]';
+  }
+}
+
+function sanitizeShortcutSessionName(rawValue) {
+  if (typeof rawValue !== 'string') {
+    return null;
+  }
+
+  // Keep user-visible names readable while stripping unsupported characters.
+  // Preserve Unicode letters (including diacritics) and common punctuation.
+  const sanitized = rawValue
+    .replace(/[^\p{L}\p{M}\p{N}_\s.,()@&'!+#-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, SHORTCUT_SESSION_NAME_MAX_LENGTH);
+
+  return sanitized || null;
+}
+
+function registerShortcutProtocolClient() {
+  if (process.platform !== 'darwin') {
+    return false;
+  }
+
+  // In development (electron .), macOS protocol registration needs executable + app args.
+  if (!app.isPackaged) {
+    return app.setAsDefaultProtocolClient(
+      SHORTCUT_PROTOCOL,
+      process.execPath,
+      [path.resolve(process.argv[1])]
+    );
+  }
+
+  return app.setAsDefaultProtocolClient(SHORTCUT_PROTOCOL);
+}
+
+// Backend executable path - always use bundled stenoai
+function getBackendPath() {
+  if (app.isPackaged) {
+    // Production: bundled in app resources
+    return path.join(process.resourcesPath, 'stenoai', 'stenoai');
+  } else {
+    // Development: use local build
+    return path.join(__dirname, '..', 'dist', 'stenoai', 'stenoai');
+  }
+}
+
+function getBackendCwd() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'stenoai');
+  } else {
+    return path.join(__dirname, '..', 'dist', 'stenoai');
+  }
+}
+
+function parseShortcutUrl(incomingUrl) {
+  try {
+    const parsed = new URL(incomingUrl);
+    if (parsed.protocol !== `${SHORTCUT_PROTOCOL}:`) {
+      return { type: 'invalid', reason: 'invalid-protocol' };
+    }
+
+    if (parsed.hostname !== SHORTCUT_HOST) {
+      return { type: 'invalid', reason: 'invalid-host' };
+    }
+
+    const cleanPath = (parsed.pathname || '').replace(/\/+$/, '');
+    if (cleanPath === '/start') {
+      const sessionName = sanitizeShortcutSessionName(parsed.searchParams.get('name') || '');
+      return {
+        type: 'start',
+        sessionName
+      };
+    }
+
+    if (cleanPath === '/stop') {
+      return { type: 'stop' };
+    }
+
+    return { type: 'invalid', reason: 'invalid-path' };
+  } catch (error) {
+    return { type: 'invalid', reason: 'parse-error' };
+  }
+}
+
+function ensureMainWindow() {
+  if (!app.isReady()) {
+    sendDebugLog('Shortcut action received before app ready; deferring window creation');
+    return false;
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+  }
+
+  return true;
+}
+
+function dispatchShortcutAction(action) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return false;
+  }
+
+  if (action.type === 'start') {
+    mainWindow.webContents.send('shortcut-start-recording', {
+      sessionName: action.sessionName || null
+    });
+    launchedByShortcut = false;
+    return true;
+  }
+
+  if (action.type === 'stop') {
+    mainWindow.webContents.send('shortcut-stop-recording');
+    launchedByShortcut = false;
+    return true;
+  }
+
+  return false;
+}
+
+function flushShortcutQueue() {
+  if (!rendererShortcutReady || !mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  while (shortcutQueue.length > 0) {
+    const nextAction = shortcutQueue.shift();
+    const dispatched = dispatchShortcutAction(nextAction);
+    if (!dispatched) {
+      shortcutQueue.unshift(nextAction);
+      break;
+    }
+  }
+}
+
+function enqueueShortcutAction(action) {
+  if (shortcutQueue.length >= 5) {
+    sendDebugLog('Shortcut queue overflow, dropping oldest action');
+    shortcutQueue.shift();
+  }
+  shortcutQueue.push(action);
+  flushShortcutQueue();
+}
+
+async function shouldShowShortcutNotifications() {
+  try {
+    const settings = await handleGetNotifications();
+    if (!settings.success) {
+      return true;
+    }
+    return settings.notifications_enabled !== false;
+  } catch (error) {
+    return true;
+  }
+}
+
+async function showShortcutNotification(body) {
+  if (process.platform !== 'darwin') {
+    return;
+  }
+
+  try {
+    const enabled = await shouldShowShortcutNotifications();
+    if (!enabled || !Notification.isSupported()) {
+      return;
+    }
+
+    new Notification({
+      title: 'StenoAI Shortcuts',
+      body
+    }).show();
+  } catch (error) {
+    console.error('Failed to show shortcut notification:', error.message);
+  }
+}
+
+const BACKEND_STATUS_RETRY_ATTEMPTS = 3;
+const BACKEND_STATUS_RETRY_DELAY_MS = 250;
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function isBackendRecording() {
+  for (let attempt = 1; attempt <= BACKEND_STATUS_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      const status = await handleGetStatus();
+      if (status.success) {
+        return status.status.includes('STATUS: RECORDING');
+      }
+    } catch (error) {
+      if (attempt === BACKEND_STATUS_RETRY_ATTEMPTS) {
+        console.error('Error checking recording status for shortcut action:', error.message);
+      }
+    }
+
+    if (attempt < BACKEND_STATUS_RETRY_ATTEMPTS) {
+      await wait(BACKEND_STATUS_RETRY_DELAY_MS);
+    }
+  }
+
+  console.warn('Backend status unavailable after retries; assuming not recording for shortcut action');
+  return false;
+}
+
+async function handleShortcutUrl(incomingUrl) {
+  const parsedAction = parseShortcutUrl(incomingUrl);
+  const safeShortcutUrl = sanitizeShortcutUrlForLogs(incomingUrl);
+
+  if (parsedAction.type === 'invalid') {
+    sendDebugLog(`Ignored invalid shortcut URL (${parsedAction.reason}): ${safeShortcutUrl}`);
+    await showShortcutNotification('Invalid shortcut URL');
+    launchedByShortcut = false;
+    return;
+  }
+
+  const backendRecording = await isBackendRecording();
+  const recording = backendRecording || systemAudioRecordingActive;
+
+  if (parsedAction.type === 'start') {
+    if (recording) {
+      await showShortcutNotification('Recording already in progress');
+      launchedByShortcut = false;
+      return;
+    }
+
+    if (!ensureMainWindow()) {
+      launchedByShortcut = true;
+      pendingShortcutUrls.push(incomingUrl);
+      return;
+    }
+    enqueueShortcutAction(parsedAction);
+    await showShortcutNotification('Start recording requested');
+    return;
+  }
+
+  if (!recording) {
+    await showShortcutNotification('Recording already stopped');
+    launchedByShortcut = false;
+    return;
+  }
+
+  if (!ensureMainWindow()) {
+    launchedByShortcut = true;
+    pendingShortcutUrls.push(incomingUrl);
+    return;
+  }
+  enqueueShortcutAction(parsedAction);
+  await showShortcutNotification('Stop recording requested');
+}
+
+// Telemetry state
+let posthogClient = null;
+let telemetryEnabled = false;
+let anonymousId = null;
+
+const POSTHOG_API_KEY = process.env.STENOAI_POSTHOG_API_KEY || '';
+const POSTHOG_HOST = 'https://us.i.posthog.com';
+
+// Google Calendar OAuth2 configuration
+const GOOGLE_CLIENT_ID = process.env.STENOAI_GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.STENOAI_GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
+const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+
+// Outlook Calendar OAuth2 configuration (PKCE public client — no client secret)
+const OUTLOOK_CLIENT_ID = process.env.STENOAI_OUTLOOK_CLIENT_ID || '';
+const OUTLOOK_SCOPES = 'Calendars.Read offline_access';
+const OUTLOOK_AUTH_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
+const OUTLOOK_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
+
+/**
+ * Return a privacy-safe duration bucket string.
+ */
+function durationBucket(seconds) {
+  if (seconds < 60) return '<1m';
+  if (seconds < 300) return '1-5m';
+  if (seconds < 900) return '5-15m';
+  if (seconds < 1800) return '15-30m';
+  if (seconds < 3600) return '30-60m';
+  return '60m+';
+}
+
+/**
+ * Initialize PostHog telemetry by reading config from Python backend.
+ */
+async function initTelemetry() {
+  if (IS_E2E) {
+    telemetryEnabled = false;
+    return;
+  }
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn(getBackendPath(), ['get-telemetry'], {
+        cwd: getBackendCwd()
+      });
+      let stdout = '';
+      proc.stdout.on('data', (data) => { stdout += data.toString(); });
+      proc.on('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`get-telemetry exited with code ${code}`));
+      });
+      proc.on('error', reject);
+    });
+
+    const config = JSON.parse(result.trim());
+    telemetryEnabled = config.telemetry_enabled;
+    anonymousId = config.anonymous_id;
+
+    if (telemetryEnabled) {
+      posthogClient = new PostHog(POSTHOG_API_KEY, { host: POSTHOG_HOST });
+      // Identify user for DAU tracking
+      posthogClient.identify({
+        distinctId: anonymousId,
+        properties: {
+          platform: process.platform,
+          arch: process.arch
+        }
+      });
+      console.log('Telemetry initialized (anonymous analytics enabled)');
+    } else {
+      console.log('Telemetry disabled by user preference');
+    }
+  } catch (error) {
+    console.error('Failed to initialize telemetry:', error.message);
+    telemetryEnabled = false;
+  }
+}
+
+/**
+ * Track an analytics event. Silent fail -- never throws.
+ */
+function trackEvent(eventName, properties = {}) {
+  try {
+    if (!telemetryEnabled || !posthogClient || !anonymousId) return;
+
+    const packagePath = path.join(__dirname, 'package.json');
+    const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+
+    posthogClient.capture({
+      distinctId: anonymousId,
+      event: eventName,
+      properties: {
+        app_version: packageContent.version,
+        platform: process.platform,
+        arch: process.arch,
+        ...properties
+      }
+    });
+  } catch (error) {
+    // Silent fail -- telemetry must never break the app
+  }
+}
+
+/**
+ * Flush and shut down the PostHog client.
+ */
+async function shutdownTelemetry() {
+  try {
+    if (posthogClient) {
+      await posthogClient.shutdown();
+      posthogClient = null;
+      console.log('Telemetry shut down');
+    }
+  } catch (error) {
+    // Silent fail
+  }
+}
+
+/**
+ * Get the list of allowed base directories, including any custom storage path.
+ */
+let _cachedCustomStoragePath = null;
+function getAllowedBaseDirs() {
+  const projectRoot = path.join(__dirname, '..');
+  const dirs = [
+    projectRoot,
+    path.join(os.homedir(), 'Library', 'Application Support', 'stenoai')
+  ];
+  if (_cachedCustomStoragePath) {
+    dirs.push(_cachedCustomStoragePath);
+  }
+  return dirs;
+}
+
+/**
+ * Validate that a file path is within allowed directories (security)
+ * Prevents path traversal attacks by ensuring files are only accessed
+ * within the app's designated data directories
+ */
+function validateSafeFilePath(filepath, allowedBaseDirs) {
+  if (!filepath) return false;
+
+  try {
+    // Resolve to absolute path and normalize
+    const resolvedPath = path.resolve(filepath);
+
+    // Ensure it's within one of the allowed base directories
+    for (const baseDir of allowedBaseDirs) {
+      const resolvedBase = path.resolve(baseDir);
+      if (resolvedPath.startsWith(resolvedBase + path.sep) || resolvedPath === resolvedBase) {
+        return true;
+      }
+    }
+
+    return false;
+  } catch (error) {
+    console.error('Error validating file path:', error);
+    return false;
+  }
+}
+
+function createWindow(options = {}) {
+  rendererShortcutReady = false;
+
+  const windowOpts = {
+    width: 1200,
+    height: 800,
+    minWidth: 1000,
+    minHeight: 600,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+      preload: path.join(__dirname, 'preload.js'),
+      scrollBounce: true,
+    },
+    titleBarStyle: 'hiddenInset',
+    show: false,
+    backgroundColor: '#FAF9F5',
+    // React UI renders the macOS traffic lights inside the sidebar's top
+    // band rather than floating above a fixed titlebar.
+    trafficLightPosition: { x: 18, y: 18 },
+  };
+  if (options.bounds && typeof options.bounds.x === 'number') {
+    Object.assign(windowOpts, options.bounds);
+  }
+
+  mainWindow = new BrowserWindow(windowOpts);
+
+  const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
+  const hash = process.env.STENOAI_RENDERER_HASH;
+  if (hash) {
+    mainWindow.loadFile(rendererDist, { hash });
+  } else {
+    mainWindow.loadFile(rendererDist);
+  }
+
+  windowReadyToShow = false;
+
+  const showWhenReady = () => {
+    windowReadyToShow = true;
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show();
+    }
+  };
+
+  mainWindow.once('ready-to-show', () => {
+    if (launchedByShortcut) {
+      return;
+    }
+    // Wait until React signals it has mounted. Fall back to showing after
+    // 4s in case the signal never arrives.
+    const fallback = setTimeout(showWhenReady, 4000);
+    ipcMain.once('renderer-ready-to-show', () => {
+      clearTimeout(fallback);
+      showWhenReady();
+    });
+  });
+
+
+
+  // On macOS, hide to tray instead of destroying (like Slack, Spotify)
+  mainWindow.on('close', (event) => {
+    if (process.platform === 'darwin' && !isQuitting) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+    rendererShortcutReady = false;
+    if (pythonProcess) {
+      pythonProcess.kill();
+    }
+  });
+}
+
+function getTrayIconPath(recording) {
+  const iconName = recording ? 'trayIconRecordingTemplate' : 'trayIconTemplate';
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'assets', `${iconName}.png`);
+  }
+  return path.join(__dirname, 'assets', `${iconName}.png`);
+}
+
+function createTray() {
+  const icon = nativeImage.createFromPath(getTrayIconPath(false));
+  icon.setTemplateImage(true);
+  tray = new Tray(icon);
+  tray.setToolTip('StenoAI');
+
+  updateTrayMenu();
+}
+
+function updateTrayIcon(recording) {
+  if (!tray) return;
+  const icon = nativeImage.createFromPath(getTrayIconPath(recording));
+  icon.setTemplateImage(true);
+  tray.setImage(icon);
+  tray.setToolTip(recording ? 'StenoAI - Recording' : 'StenoAI');
+  updateTrayMenu();
+}
+
+function showAndFocusWindow() {
+  if (mainWindow) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  const isRecording = currentRecordingProcess !== null || systemAudioRecordingActive;
+
+  const appVersion = require('./package.json').version;
+
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Open StenoAI',
+      click: showAndFocusWindow
+    },
+    {
+      label: isRecording ? 'Stop Recording' : 'Start Recording',
+      click: () => {
+        if (mainWindow) {
+          mainWindow.webContents.send(isRecording ? 'tray-stop-recording' : 'tray-start-recording');
+        }
+      }
+    },
+    {
+      label: 'Settings',
+      click: () => {
+        showAndFocusWindow();
+        if (mainWindow) {
+          mainWindow.webContents.send('tray-open-settings');
+        }
+      }
+    },
+    {
+      label: 'Hide StenoAI',
+      click: () => {
+        if (mainWindow) mainWindow.hide();
+      }
+    },
+    { type: 'separator' },
+    {
+      label: `StenoAI v${appVersion}`,
+      enabled: false
+    },
+    {
+      label: 'Report a Bug',
+      click: () => {
+        shell.openExternal('https://discord.gg/DZ6vcQnxxu');
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit StenoAI',
+      click: () => {
+        app.quit();
+      }
+    }
+  ]);
+
+  tray.setContextMenu(contextMenu);
+}
+
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (event, argv) => {
+    const shortcutUrl = extractShortcutUrlFromArgv(argv);
+    if (shortcutUrl) {
+      if (app.isReady()) {
+        handleShortcutUrl(shortcutUrl).catch(err => {
+          sendDebugLog(`Error handling shortcut URL: ${err.message}`);
+        });
+      } else {
+        launchedByShortcut = true;
+        pendingShortcutUrls.push(shortcutUrl);
+      }
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+
+  // Sends the custom in-app quit dialog to the renderer and waits for a response.
+  // Falls back to true (allow quit) if the window is unavailable. A 5s timeout
+  // guards against a wedged React tree — on timeout we resolve false to
+  // preserve any active recording rather than killing it silently.
+  async function showCustomQuitDialog(type, jobCount) {
+    if (!mainWindow || mainWindow.isDestroyed()) return true;
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('show-quit-dialog', { type, jobCount });
+    return new Promise((resolve) => {
+      const handler = (_event, data) => {
+        clearTimeout(timer);
+        resolve(data && data.confirmed === true);
+      };
+      const timer = setTimeout(() => {
+        ipcMain.removeListener('quit-dialog-response', handler);
+        resolve(false);
+      }, 5000);
+      ipcMain.once('quit-dialog-response', handler);
+    });
+  }
+
+  app.on('before-quit', async (event) => {
+    if (isQuitting) return;
+
+    // Use synchronous flag -- systemAudioRecordingActive is updated via IPC on each state change
+    if (currentRecordingProcess || systemAudioRecordingActive) {
+      event.preventDefault();
+      const confirmed = await showCustomQuitDialog('recording');
+      if (confirmed) {
+        if (currentRecordingProcess) {
+          currentRecordingProcess.kill('SIGTERM');
+          currentRecordingProcess = null;
+          currentRecordingSessionName = null;
+        }
+        if (systemAudioRecordingActive && mainWindow && !mainWindow.isDestroyed()) {
+          try {
+            await mainWindow.webContents.executeJavaScript('stopSystemAudioRecording("quit")');
+          } catch (e) {
+            // Best effort -- file is saved even if processing doesn't start
+          }
+        }
+        systemAudioRecordingActive = false;
+        updateTrayIcon(false);
+        isQuitting = true;
+        app.quit();
+      }
+    } else if (isProcessing || processingQueue.length > 0) {
+      event.preventDefault();
+      const jobCount = processingQueue.length + (isProcessing ? 1 : 0);
+      const confirmed = await showCustomQuitDialog('processing', jobCount);
+      if (confirmed) {
+        isQuitting = true;
+        app.quit();
+      }
+    } else {
+      isQuitting = true;
+    }
+  });
+
+  app.on('open-url', (event, incomingUrl) => {
+    if (process.platform !== 'darwin') {
+      return;
+    }
+
+    event.preventDefault();
+    sendDebugLog(`Received shortcut URL via open-url: ${sanitizeShortcutUrlForLogs(incomingUrl)}`);
+
+    if (!app.isReady()) {
+      launchedByShortcut = true;
+      pendingShortcutUrls.push(incomingUrl);
+      return;
+    }
+
+    handleShortcutUrl(incomingUrl).catch(err => {
+      sendDebugLog(`Error handling shortcut URL: ${err.message}`);
+    });
+  });
+
+  app.whenReady().then(async () => {
+    // Set application menu with Help > Learn More
+    const appMenu = Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      { role: 'fileMenu' },
+      { role: 'editMenu' },
+      { role: 'viewMenu' },
+      { role: 'windowMenu' },
+      {
+        role: 'help',
+        submenu: [
+          {
+            label: 'Learn More',
+            click: () => {
+              shell.openExternal('https://github.com/ruzin/stenoai');
+            }
+          },
+          {
+            label: 'Report a Bug',
+            click: () => {
+              shell.openExternal('https://discord.gg/DZ6vcQnxxu');
+            }
+          }
+        ]
+      }
+    ]);
+    Menu.setApplicationMenu(appMenu);
+
+    if (process.platform === 'darwin') {
+      try {
+        const osVer = process.getSystemVersion();
+        const screenPerm = systemPreferences.getMediaAccessStatus('screen');
+        const tapOk = isCoreAudioTapSupported();
+        sendDebugLog(`[sysaudio] macOS ${osVer} — CoreAudio Tap supported=${tapOk}, screen permission=${screenPerm}`);
+      } catch (e) {
+        sendDebugLog(`[sysaudio] startup probe failed: ${e.message}`);
+      }
+    }
+
+    createWindow();
+    if (!IS_E2E) createTray();
+    setupAutoUpdater();
+    const protocolRegistered = registerShortcutProtocolClient();
+    sendDebugLog(`Protocol handler registration (${SHORTCUT_PROTOCOL}): ${protocolRegistered}`);
+
+    // Load hide-dock-icon preference and apply
+    if (process.platform === 'darwin' && app.dock) {
+      try {
+        const dockResult = await new Promise((resolve, reject) => {
+          const proc = spawn(getBackendPath(), ['get-dock-icon'], {
+            cwd: getBackendCwd()
+          });
+          let stdout = '';
+          proc.stdout.on('data', (data) => { stdout += data.toString(); });
+          proc.on('close', (code) => {
+            if (code === 0) resolve(stdout);
+            else reject(new Error(`get-dock-icon exited with code ${code}`));
+          });
+          proc.on('error', reject);
+        });
+
+        const dockConfig = JSON.parse(dockResult.trim());
+        if (dockConfig.hide_dock_icon) {
+          app.dock.hide();
+          console.log('Dock icon hidden (menu bar only mode)');
+        }
+      } catch (e) {
+        console.error('Failed to load dock icon preference:', e.message);
+      }
+    }
+
+    // Initialize telemetry and track app open
+    await initTelemetry();
+    trackEvent('app_opened');
+
+    // Load custom storage path for file validation
+    try {
+      const spResult = await runPythonScript('simple_recorder.py', ['get-storage-path'], true);
+      const spData = JSON.parse(spResult.trim());
+      if (spData.storage_path) {
+        _cachedCustomStoragePath = spData.storage_path;
+        console.log('Custom storage path loaded:', _cachedCustomStoragePath);
+      }
+    } catch (e) {
+      // Non-fatal - custom path just won't be cached
+    }
+
+    // Register global hotkey for toggle recording (Cmd+Shift+R on macOS, Ctrl+Shift+R on Windows/Linux)
+    const hotkeyModifier = process.platform === 'darwin' ? 'Command+Shift+R' : 'Ctrl+Shift+R';
+    const registered = globalShortcut.register(hotkeyModifier, () => {
+      console.log('Global hotkey triggered: toggle recording');
+      if (mainWindow) {
+        mainWindow.webContents.send('toggle-recording-hotkey');
+      }
+    });
+
+    if (registered) {
+      console.log(`Global hotkey registered: ${hotkeyModifier}`);
+    } else {
+      console.error(`Failed to register global hotkey: ${hotkeyModifier}`);
+    }
+
+    if (pendingShortcutUrls.length > 0) {
+      const urlsToProcess = [...pendingShortcutUrls];
+      pendingShortcutUrls = [];
+
+      for (const shortcutUrl of urlsToProcess) {
+        await handleShortcutUrl(shortcutUrl);
+      }
+    }
+  });
+
+  // Fallback for launch contexts where deep-link may arrive via argv instead of open-url.
+  if (process.platform === 'darwin') {
+    const argvShortcutUrl = extractShortcutUrlFromArgv(process.argv);
+    if (argvShortcutUrl) {
+      pendingShortcutUrls.push(argvShortcutUrl);
+      launchedByShortcut = true;
+    }
+  }
+
+  app.on('will-quit', async () => {
+    globalShortcut.unregisterAll();
+    if (tray) {
+      tray.destroy();
+      tray = null;
+    }
+    // Kill Ollama on quit. The process may have been started by Electron or
+    // the Python backend — both write the PID to ollama.pid in _internal/.
+    const pidFile = path.join(getBackendCwd(), '_internal', 'ollama.pid');
+    try {
+      const pid = parseInt(require('fs').readFileSync(pidFile, 'utf8').trim(), 10);
+      if (pid) {
+        process.kill(pid, 'SIGTERM');
+        // Give it a moment to shut down, then force-kill if still alive
+        setTimeout(() => {
+          try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+        }, 1000);
+      }
+      require('fs').unlinkSync(pidFile);
+    } catch (_) {}
+    // Also kill if Electron spawned it directly
+    if (ollamaPid) {
+      try { process.kill(ollamaPid, 'SIGTERM'); } catch (_) {}
+      ollamaPid = null;
+    }
+    await shutdownTelemetry();
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit();
+    }
+  });
+
+  app.on('activate', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      // Only show if the window has finished its initial load.
+      // On first launch, windowReadyToShow is false until React mounts.
+      if (windowReadyToShow) {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+      launchedByShortcut = false;
+    } else {
+      launchedByShortcut = false;
+      createWindow();
+    }
+  });
+}
+
+// Focus window handler (used by notification click to bring app to foreground)
+ipcMain.on('focus-window', () => {
+    if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+    }
+});
+
+ipcMain.on('shortcut-renderer-ready', () => {
+  rendererShortcutReady = true;
+  flushShortcutQueue();
+});
+
+// Microphone permission handlers
+ipcMain.handle('check-microphone-permission', async () => {
+  try {
+    const status = systemPreferences.getMediaAccessStatus('microphone');
+    console.log('Microphone permission status:', status);
+    return { success: true, status };
+  } catch (error) {
+    console.error('Error checking microphone permission:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('request-microphone-permission', async () => {
+  try {
+    console.log('Requesting microphone permission...');
+    const granted = await systemPreferences.askForMediaAccess('microphone');
+    console.log('Microphone permission granted:', granted);
+    return { success: true, granted };
+  } catch (error) {
+    console.error('Error requesting microphone permission:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Reports whether system-audio capture is available on this OS and what the
+// current Screen Recording permission state is. Used by Settings to disable
+// the toggle on unsupported macOS, and to surface "permission denied" rather
+// than letting the user produce silent recordings.
+ipcMain.handle('get-system-audio-support', async () => {
+  try {
+    const supported = isCoreAudioTapSupported();
+    let screenPermission = 'unknown';
+    let osVersion = '';
+    if (process.platform === 'darwin') {
+      try { osVersion = process.getSystemVersion(); } catch (_) {}
+      try { screenPermission = systemPreferences.getMediaAccessStatus('screen'); } catch (_) {}
+    }
+    return { success: true, supported, osVersion, screenPermission };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Debug functionality handled by side panel now
+
+// Backend communication - always uses bundled stenoai executable
+function runPythonScript(script, args = [], silent = false, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    const backendPath = getBackendPath();
+
+    // Log the command being executed (unless silent)
+    console.log('Running:', `${backendPath} ${args.join(' ')}`);
+    if (!silent) {
+      sendDebugLog(`$ stenoai ${args.join(' ')}`);
+    }
+
+    const process = spawn(backendPath, args, {
+      cwd: getBackendCwd(),
+      env: Object.keys(extraEnv).length > 0 ? { ...require('process').env, ...extraEnv } : undefined
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    process.stdout.on('data', (data) => {
+      const output = data.toString();
+      stdout += output;
+      console.log('Python stdout:', output);
+      // Stream stdout to debug panel in real-time (unless silent)
+      if (!silent) {
+        output.split('\n').forEach(line => {
+          if (line.trim()) sendDebugLog(line.trim());
+        });
+      }
+    });
+
+    process.stderr.on('data', (data) => {
+      const output = data.toString();
+      stderr += output;
+      console.log('Python stderr:', output);
+      // Stream stderr to debug panel in real-time (unless silent)
+      if (!silent) {
+        output.split('\n').forEach(line => {
+          if (line.trim()) sendDebugLog('STDERR: ' + line.trim());
+        });
+      }
+    });
+
+    process.on('close', (code) => {
+      if (!silent) {
+        sendDebugLog(`Command completed with exit code: ${code}`);
+      }
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`Python script failed with code ${code}: ${stderr}`));
+      }
+    });
+    
+    process.on('error', (error) => {
+      sendDebugLog(`Command error: ${error.message}`);
+      reject(error);
+    });
+  });
+}
+
+async function getBackendStatusInternal(silent = true) {
+  const result = await runPythonScript('simple_recorder.py', ['status'], silent);
+  return { success: true, status: result };
+}
+
+async function handleGetStatus() {
+  try {
+    return await getBackendStatusInternal(true); // Silent mode
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function handleGetNotifications() {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-notifications']);
+    const jsonData = JSON.parse(result);
+
+    return {
+      success: true,
+      ...jsonData
+    };
+  } catch (error) {
+    sendDebugLog(`Error getting notification settings: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+// IPC Handlers - Separate start/stop with better error handling
+ipcMain.handle('start-recording', async (event, sessionName) => {
+  try {
+    sendDebugLog(`Starting recording session: ${sessionName || 'Meeting'}`);
+    sendDebugLog('$ python simple_recorder.py start');
+
+    // Start recording (removed clear-state to prevent race conditions)
+    const result = await runPythonScript('simple_recorder.py', ['start', sessionName || 'Meeting']);
+
+    if (result.includes('SUCCESS')) {
+      sendDebugLog('Recording started successfully');
+      trackEvent('recording_started');
+      return { success: true, message: result };
+    } else {
+      sendDebugLog(`Recording failed: ${result}`);
+      return { success: false, error: result };
+    }
+  } catch (error) {
+    console.error('Start recording error:', error.message);
+    sendDebugLog(`Recording error: ${error.message}`);
+    trackEvent('error_occurred', { error_type: 'start_recording' });
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('stop-recording', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['stop']);
+
+    if (result.includes('SUCCESS') || result.includes('Recording saved')) {
+      trackEvent('recording_stopped');
+      return { success: true, message: result };
+    } else {
+      return { success: false, error: result };
+    }
+  } catch (error) {
+    console.error('Stop recording error:', error.message);
+    trackEvent('error_occurred', { error_type: 'stop_recording' });
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-status', handleGetStatus);
+
+ipcMain.handle('process-recording', async (event, audioFile, sessionName) => {
+  try {
+    const cloudKey = loadCloudApiKey();
+    const env = cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {};
+    const result = await runPythonScript('simple_recorder.py', ['process', audioFile, '--name', sessionName], false, env);
+    trackEvent('transcription_completed', { success: true });
+    trackEvent('summarization_completed', { success: true });
+    return { success: true, result: result };
+  } catch (error) {
+    trackEvent('error_occurred', { error_type: 'process_recording' });
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('test-system', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['test']);
+    return { success: true, result: result };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('select-audio-file', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [
+      { name: 'Audio Files', extensions: ['wav', 'mp3', 'm4a', 'aac', 'webm'] }
+    ]
+  });
+  
+  if (!result.canceled && result.filePaths.length > 0) {
+    return { success: true, filePath: result.filePaths[0] };
+  }
+  
+  return { success: false, error: 'No file selected' };
+});
+
+ipcMain.handle('list-meetings', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['list-meetings'], true); // Silent mode
+    return { success: true, meetings: JSON.parse(result) };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('clear-state', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['clear-state']);
+    return { success: true, message: result };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName) => {
+  try {
+    const args = ['reprocess', summaryFile];
+    if (regenerateTitle) args.push('--regenerate-title');
+
+    sendDebugLog(`🔄 Reprocessing meeting: ${summaryFile}`);
+    sendDebugLog(`$ stenoai ${args.join(' ')}`);
+
+    const cloudKey = loadCloudApiKey();
+    const reprocessEnv = cloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: cloudKey } : undefined;
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn(getBackendPath(), args, {
+        cwd: getBackendCwd(),
+        env: reprocessEnv
+      });
+
+      let stderrBuf = '';
+
+      const procTimeout = setTimeout(() => {
+        console.error('reprocess timed out after 30 minutes, killing');
+        proc.kill();
+      }, 30 * 60 * 1000);
+
+      proc.on('error', (err) => {
+        clearTimeout(procTimeout);
+        reject(new Error(`reprocess spawn error: ${err.message}`));
+      });
+
+      proc.stdout.on('data', (data) => {
+        const text = data.toString();
+        text.split('\n').forEach(line => {
+          if (line.startsWith('CHUNK:')) {
+            try {
+              const encoded = line.slice(6);
+              const chunk = Buffer.from(encoded, 'base64').toString('utf-8');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('summary-chunk', { chunk, sessionName });
+              }
+            } catch (e) { console.log('CHUNK decode error:', e.message); }
+          } else if (line.startsWith('TITLE:')) {
+            const title = line.slice(6);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('summary-title', { title, sessionName });
+            }
+          } else if (line === 'STREAM_COMPLETE') {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('summary-complete', { success: true, sessionName });
+            }
+          } else if (line.trim()) {
+            sendDebugLog(line.trim());
+          }
+        });
+      });
+
+      proc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) {
+          stderrBuf += msg + '\n';
+          sendDebugLog(`STDERR: ${msg}`);
+        }
+      });
+
+      proc.on('close', (code) => {
+        clearTimeout(procTimeout);
+        if (code === 0) {
+          console.log(`✅ Completed reprocessing: ${sessionName}`);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('processing-complete', {
+              success: true,
+              sessionName,
+              message: 'Reprocessing completed successfully'
+            });
+          }
+          resolve();
+        } else {
+          reject(new Error(`reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
+        }
+      });
+    });
+
+    sendDebugLog('✅ Meeting reprocessed successfully');
+    return { success: true };
+  } catch (error) {
+    sendDebugLog(`❌ Reprocessing failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) => {
+  try {
+    const cloudKey = loadCloudApiKey();
+    const regenEnv = cloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: cloudKey } : undefined;
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn(getBackendPath(), ['regen-title', summaryFile], {
+        cwd: getBackendCwd(),
+        env: regenEnv,
+      });
+
+      let stderrBuf = '';
+      const procTimeout = setTimeout(() => { proc.kill(); }, 2 * 60 * 1000);
+
+      proc.on('error', (err) => { clearTimeout(procTimeout); reject(new Error(err.message)); });
+
+      proc.stdout.on('data', (data) => {
+        data.toString().split('\n').forEach((line) => {
+          if (line.startsWith('TITLE:')) {
+            const title = line.slice(6);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('summary-title', { title, sessionName });
+            }
+          }
+        });
+      });
+
+      proc.stderr.on('data', (data) => { stderrBuf += data.toString(); });
+
+      proc.on('close', (code) => {
+        clearTimeout(procTimeout);
+        if (code === 0) resolve();
+        else reject(new Error(`regen-title exited with code ${code}: ${stderrBuf.slice(-300)}`));
+      });
+    });
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
+  try {
+    sendDebugLog(`🤖 Querying transcript: ${question.substring(0, 50)}...`);
+
+    // Run the query command (pass cloud key for cloud provider)
+    const cloudKey = loadCloudApiKey();
+    const env = cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {};
+    const result = await runPythonScript('simple_recorder.py', ['query', summaryFile, '-q', question], false, env);
+
+    // Parse the JSON response
+    try {
+      const jsonResponse = JSON.parse(result.trim());
+      if (jsonResponse.success) {
+        sendDebugLog('✅ Query answered successfully');
+        trackEvent('ai_query_used', { success: true });
+        return { success: true, answer: jsonResponse.answer };
+      } else {
+        sendDebugLog(`❌ Query failed: ${jsonResponse.error}`);
+        trackEvent('ai_query_used', { success: false });
+        return { success: false, error: jsonResponse.error };
+      }
+    } catch (parseError) {
+      // If parsing fails, check if the result contains any JSON
+      const jsonMatch = result.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const jsonResponse = JSON.parse(jsonMatch[0]);
+        if (jsonResponse.success) {
+          trackEvent('ai_query_used', { success: true });
+          return { success: true, answer: jsonResponse.answer };
+        } else {
+          trackEvent('ai_query_used', { success: false });
+          return { success: false, error: jsonResponse.error };
+        }
+      }
+      sendDebugLog(`❌ Failed to parse query response: ${parseError.message}`);
+      trackEvent('ai_query_used', { success: false });
+      return { success: false, error: 'Failed to parse AI response' };
+    }
+  } catch (error) {
+    sendDebugLog(`❌ Query failed: ${error.message}`);
+    trackEvent('error_occurred', { error_type: 'query_transcript' });
+    return { success: false, error: error.message };
+  }
+});
+
+const activeQueryProcs = new Map();
+
+ipcMain.on('query-cancel', (_event, queryId) => {
+  const proc = activeQueryProcs.get(queryId);
+  if (proc) {
+    console.log(`[QUERY] Cancelling queryId=${queryId}`);
+    proc.kill();
+    activeQueryProcs.delete(queryId);
+  }
+});
+
+ipcMain.on('query-transcript-stream', (event, queryId, summaryFile, question) => {
+  console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
+  sendDebugLog(`🤖 Streaming query: ${question.substring(0, 50)}...`);
+  const cloudKey = loadCloudApiKey();
+  const env = cloudKey ? { ...process.env, STENOAI_CLOUD_API_KEY: cloudKey } : process.env;
+
+  let proc;
+  try {
+    const backendPath = getBackendPath();
+    proc = require('child_process').spawn(backendPath, ['query-streaming', summaryFile, '-q', question], {
+      env,
+      cwd: getBackendCwd(),
+    });
+  } catch (err) {
+    event.sender.send('query-done', { queryId, success: false, error: err.message });
+    return;
+  }
+
+  activeQueryProcs.set(queryId, proc);
+  // Kill the spawned proc if the renderer sender goes away before the query
+  // finishes. Keep a reference so we can remove the listener on normal close
+  // (otherwise repeated queries on a long-lived sender leak one-time listeners).
+  const onSenderDestroyed = () => {
+    if (activeQueryProcs.has(queryId)) {
+      proc.kill();
+      activeQueryProcs.delete(queryId);
+    }
+  };
+  event.sender.once('destroyed', onSenderDestroyed);
+  let buf = '';
+  let chunkCount = 0;
+  proc.stdout.on('data', (data) => {
+    buf += data.toString();
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('CHAT_CHUNK:') || line.startsWith('CHUNK:')) {
+        const prefixLen = line.startsWith('CHAT_CHUNK:') ? 11 : 6;
+        try {
+          const chunk = Buffer.from(line.slice(prefixLen), 'base64').toString('utf-8');
+          chunkCount++;
+          if (chunkCount === 1) console.log(`[QUERY] First chunk received (queryId=${queryId})`);
+          if (!event.sender.isDestroyed()) event.sender.send('query-chunk', { queryId, chunk });
+          else {
+            console.log(`[QUERY] Sender destroyed, killing process queryId=${queryId}`);
+            proc.kill();
+            activeQueryProcs.delete(queryId);
+          }
+        } catch (e) { console.log(`[QUERY] Chunk decode error: ${e.message}`); }
+      } else if (line === 'CHAT_STREAM_COMPLETE' || line === 'STREAM_COMPLETE') {
+        console.log(`[QUERY] STREAM_COMPLETE received, ${chunkCount} chunks sent`);
+        if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: true });
+        else console.log(`[QUERY] Sender destroyed at STREAM_COMPLETE`);
+      } else if (line.startsWith('CHAT_STREAM_ERROR:') || line.startsWith('STREAM_ERROR:')) {
+        const errMsg = line.startsWith('CHAT_STREAM_ERROR:') ? line.slice(18) : line.slice(13);
+        console.log(`[QUERY] STREAM_ERROR: ${errMsg}`);
+        if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: false, error: errMsg });
+      }
+    }
+  });
+
+  proc.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg) console.log(`[QUERY stderr] ${msg.substring(0, 200)}`);
+  });
+
+  proc.on('close', (code) => {
+    activeQueryProcs.delete(queryId);
+    if (!event.sender.isDestroyed()) {
+      event.sender.removeListener('destroyed', onSenderDestroyed);
+    }
+    console.log(`[QUERY] Process closed, code=${code}, chunks=${chunkCount}, bufRemainder=${buf.length > 0 ? JSON.stringify(buf.substring(0, 100)) : 'empty'}`);
+    if (buf.trim() === 'CHAT_STREAM_COMPLETE' || buf.trim() === 'STREAM_COMPLETE') {
+      console.log(`[QUERY] STREAM_COMPLETE was in buf remainder — sending done now`);
+      if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: true });
+    } else if (code !== 0 && code !== null && !event.sender.isDestroyed()) {
+      // code === null means killed (cancelled) — renderer already handles that case
+      event.sender.send('query-done', { queryId, success: false, error: `Process exited with code ${code}` });
+    }
+  });
+
+  proc.on('error', (err) => {
+    activeQueryProcs.delete(queryId);
+    if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: false, error: err.message });
+  });
+});
+
+// Cross-note chat (Chat tab). Same wire protocol as query-transcript-stream
+// (CHAT_CHUNK / CHAT_STREAM_COMPLETE / CHAT_STREAM_ERROR -> query-chunk /
+// query-done) so the renderer can reuse useStreamingQuery. Cloud-only —
+// the Python CLI rejects local providers because we don't have retrieval
+// yet and a full-corpus prompt blows local context windows.
+ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
+  sendDebugLog(`💬 Global chat query: ${String(question || '').slice(0, 80)}... (folder: ${folderId || 'all'})`);
+  const cloudKey = loadCloudApiKey();
+  const env = cloudKey ? { ...process.env, STENOAI_CLOUD_API_KEY: cloudKey } : process.env;
+
+  const args = ['chat-global-streaming', '-q', question];
+  if (folderId && typeof folderId === 'string' && folderId !== 'all') {
+    args.push('-f', folderId);
+  }
+
+  let proc;
+  try {
+    proc = require('child_process').spawn(
+      getBackendPath(),
+      args,
+      { env, cwd: getBackendCwd() },
+    );
+  } catch (err) {
+    event.sender.send('query-done', { queryId, success: false, error: err.message });
+    return;
+  }
+
+  activeQueryProcs.set(queryId, proc);
+  const onSenderDestroyed = () => {
+    if (activeQueryProcs.has(queryId)) {
+      proc.kill();
+      activeQueryProcs.delete(queryId);
+    }
+  };
+  event.sender.once('destroyed', onSenderDestroyed);
+
+  let buf = '';
+  let chunkCount = 0;
+  proc.stdout.on('data', (data) => {
+    buf += data.toString();
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (line.startsWith('CHAT_CHUNK:')) {
+        try {
+          const chunk = Buffer.from(line.slice(11), 'base64').toString('utf-8');
+          chunkCount++;
+          if (!event.sender.isDestroyed()) {
+            event.sender.send('query-chunk', { queryId, chunk });
+          } else {
+            proc.kill();
+            activeQueryProcs.delete(queryId);
+          }
+        } catch (e) { /* ignore decode errors */ }
+      } else if (line === 'CHAT_STREAM_COMPLETE') {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('query-done', { queryId, success: true });
+        }
+      } else if (line.startsWith('CHAT_STREAM_ERROR:')) {
+        const errMsg = line.slice(18);
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('query-done', { queryId, success: false, error: errMsg });
+        }
+      }
+    }
+  });
+
+  proc.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg) sendDebugLog(`[chat-global stderr] ${msg.slice(0, 200)}`);
+  });
+
+  proc.on('close', (code) => {
+    activeQueryProcs.delete(queryId);
+    if (!event.sender.isDestroyed()) {
+      event.sender.removeListener('destroyed', onSenderDestroyed);
+    }
+    if (buf.trim() === 'CHAT_STREAM_COMPLETE') {
+      if (!event.sender.isDestroyed()) event.sender.send('query-done', { queryId, success: true });
+    } else if (code !== 0 && code !== null && !event.sender.isDestroyed()) {
+      event.sender.send('query-done', { queryId, success: false, error: `Process exited with code ${code}` });
+    }
+  });
+
+  proc.on('error', (err) => {
+    activeQueryProcs.delete(queryId);
+    if (!event.sender.isDestroyed()) {
+      event.sender.send('query-done', { queryId, success: false, error: err.message });
+    }
+  });
+});
+
+// Chat sessions persistence.
+//
+// The legacy renderer reads/writes `chat_sessions.json` as a flat array.
+// The new renderer uses an enriched `{ sessions: [...] }` shape. To avoid
+// silently breaking the legacy UI when a user toggles between renderers, we
+// store the new shape in a separate file (`chat_sessions_v2.json`) and never
+// modify the legacy file. On first load, if v2 is absent we read the legacy
+// file once for migration; subsequent saves only touch v2.
+//
+// Writes use tmp+rename to keep the file atomic across crashes / power loss
+// (a truncated chat_sessions file is hard to recover and would lose all
+// chat history on next launch).
+const CHAT_SESSIONS_V2_FILENAME = 'chat_sessions_v2.json';
+const CHAT_SESSIONS_LEGACY_FILENAME = 'chat_sessions.json';
+
+function chatSessionsV2Path() {
+  return path.join(app.getPath('userData'), CHAT_SESSIONS_V2_FILENAME);
+}
+
+function chatSessionsLegacyPath() {
+  return path.join(app.getPath('userData'), CHAT_SESSIONS_LEGACY_FILENAME);
+}
+
+ipcMain.handle('save-chat-sessions', async (event, data) => {
+  const filePath = chatSessionsV2Path();
+  const tmpPath = `${filePath}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(data), 'utf-8');
+    fs.renameSync(tmpPath, filePath);
+    return { success: true };
+  } catch (err) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('load-chat-sessions', async () => {
+  const v2Path = chatSessionsV2Path();
+  // Prefer v2 file when present
+  if (fs.existsSync(v2Path)) {
+    try {
+      const raw = fs.readFileSync(v2Path, 'utf-8');
+      return { success: true, data: JSON.parse(raw) };
+    } catch (err) {
+      // Corrupt v2 file — quarantine it so we don't keep failing on every load,
+      // then fall through to legacy migration / empty state.
+      const corruptPath = `${v2Path}.corrupt-${Date.now()}`;
+      try { fs.renameSync(v2Path, corruptPath); } catch (_) {}
+      console.error(`[chat-sessions] v2 file unreadable, quarantined to ${corruptPath}:`, err.message);
+    }
+  }
+  // First run on the new renderer: try to migrate from the legacy file.
+  // Legacy file is read but never modified, so legacy renderer remains intact.
+  const legacyPath = chatSessionsLegacyPath();
+  if (fs.existsSync(legacyPath)) {
+    try {
+      const raw = fs.readFileSync(legacyPath, 'utf-8');
+      return { success: true, data: JSON.parse(raw), migratedFromLegacy: true };
+    } catch (err) {
+      console.error('[chat-sessions] legacy file unreadable:', err.message);
+    }
+  }
+  return { success: true, data: null };
+});
+
+ipcMain.handle('save-meeting-notes', async (event, sessionName, notes) => {
+  try {
+    const outputDir = path.join(getBackendCwd(), '_internal', 'output');
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+    const safeName = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const notesFile = path.join(outputDir, `${safeName}_notes.txt`);
+    fs.writeFileSync(notesFile, notes, 'utf-8');
+    return { success: true, path: notesFile };
+  } catch (error) {
+    console.error('Failed to save meeting notes:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
+  try {
+    const projectRoot = path.join(__dirname, '..');
+
+    // Define allowed base directories for file operations (includes custom storage)
+    const allowedBaseDirs = getAllowedBaseDirs();
+
+    // Convert to absolute path if needed
+    const absolutePath = path.isAbsolute(summaryFilePath)
+      ? summaryFilePath
+      : path.join(projectRoot, summaryFilePath);
+
+    // Security: Validate file path is within allowed directories
+    if (!validateSafeFilePath(absolutePath, allowedBaseDirs)) {
+      console.error(`Security: Blocked attempt to update file outside allowed directories: ${absolutePath}`);
+      return {
+        success: false,
+        error: 'Invalid file path'
+      };
+    }
+
+    // Read existing data
+    if (!fs.existsSync(absolutePath)) {
+      return {
+        success: false,
+        error: 'Meeting file not found'
+      };
+    }
+
+    const isMarkdown = absolutePath.endsWith('.md');
+    let data;
+
+    if (isMarkdown) {
+      const raw = fs.readFileSync(absolutePath, 'utf8');
+      // Escape a string for a YAML double-quoted scalar. Backslash MUST be
+      // escaped before the quote, and embedded newlines must become literal
+      // \n so they don't end the scalar mid-line.
+      const yamlQuote = (s) =>
+        '"' + String(s)
+          .replace(/\\/g, '\\\\')
+          .replace(/"/g, '\\"')
+          .replace(/\n/g, '\\n')
+          .replace(/\r/g, '')
+        + '"';
+
+      // Strip the outer quotes only — the simple frontmatter we read here is
+      // for the response shape (data.session_info.name) and doesn't need to
+      // reverse YAML escapes for its sole consumer (the renderer).
+      const readTitle = (rawValue) => rawValue.trim().replace(/^"|"$/g, '');
+
+      // Line-based rewrite: only mutate the keys we're updating, leave every
+      // other line (including non-string values like arrays/booleans) byte-
+      // identical so we don't corrupt structured fields like `folders: [...]`.
+      let title = '';
+      let updatedAt = new Date().toISOString();
+      let body = raw;
+      let updatedRaw = raw;
+
+      if (raw.startsWith('---')) {
+        const parts = raw.split('---', 3);
+        if (parts.length >= 3) {
+          const fmText = parts[1];
+          body = parts[2];
+          const lines = fmText.split('\n');
+          let titleSeen = false;
+          let updatedAtSeen = false;
+          const newLines = lines.map((line) => {
+            const colon = line.indexOf(':');
+            if (colon === -1) return line;
+            const key = line.slice(0, colon).trim();
+            if (key === 'title') {
+              titleSeen = true;
+              const original = line.slice(colon + 1);
+              if (updates.name !== undefined) {
+                return `title: ${yamlQuote(updates.name)}`;
+              }
+              title = readTitle(original);
+              return line;
+            }
+            if (key === 'updated_at') {
+              updatedAtSeen = true;
+              return `updated_at: ${yamlQuote(updatedAt)}`;
+            }
+            return line;
+          });
+          if (!titleSeen && updates.name !== undefined) {
+            // Insert before the trailing blank line (if any) for readability.
+            const insertIdx = newLines[newLines.length - 1] === '' ? newLines.length - 1 : newLines.length;
+            newLines.splice(insertIdx, 0, `title: ${yamlQuote(updates.name)}`);
+            title = updates.name;
+          } else if (updates.name !== undefined) {
+            title = updates.name;
+          }
+          if (!updatedAtSeen) {
+            const insertIdx = newLines[newLines.length - 1] === '' ? newLines.length - 1 : newLines.length;
+            newLines.splice(insertIdx, 0, `updated_at: ${yamlQuote(updatedAt)}`);
+          }
+          updatedRaw = `---${newLines.join('\n')}---${body}`;
+        }
+      }
+
+      fs.writeFileSync(absolutePath, updatedRaw, 'utf8');
+
+      data = {
+        session_info: {
+          name: updates.name !== undefined ? updates.name : title,
+          summary_file: absolutePath,
+          updated_at: updatedAt,
+        },
+      };
+    } else {
+      data = JSON.parse(fs.readFileSync(absolutePath, 'utf8'));
+
+      if (updates.name !== undefined) {
+        data.session_info.name = updates.name;
+      }
+      if (updates.summary !== undefined) {
+        data.summary = updates.summary;
+      }
+      if (updates.participants !== undefined) {
+        data.participants = updates.participants;
+      }
+      if (updates.key_points !== undefined) {
+        data.key_points = updates.key_points;
+      }
+      if (updates.action_items !== undefined) {
+        data.action_items = updates.action_items;
+      }
+
+      data.session_info.updated_at = new Date().toISOString();
+      fs.writeFileSync(absolutePath, JSON.stringify(data, null, 2), 'utf8');
+    }
+
+    console.log(`Updated meeting: ${absolutePath}`);
+
+    return {
+      success: true,
+      message: 'Meeting updated successfully'
+    };
+  } catch (error) {
+    console.error('Update meeting error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('reveal-meeting-folder', async (event, filePath) => {
+  try {
+    const projectRoot = path.join(__dirname, '..');
+    const allowedBaseDirs = getAllowedBaseDirs();
+    const absolutePath = path.isAbsolute(filePath) ? filePath : path.join(projectRoot, filePath);
+    if (!validateSafeFilePath(absolutePath, allowedBaseDirs)) {
+      return { success: false, error: 'Invalid file path: outside allowed directories' };
+    }
+    shell.showItemInFolder(absolutePath);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('delete-meeting', async (event, meetingData) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+
+    // meetingData is the actual meeting object, not a file path
+    const meeting = meetingData;
+
+    // Build correct file paths from the meeting data - convert to absolute paths
+    const projectRoot = path.join(__dirname, '..');
+
+    // Define allowed base directories for file operations (includes custom storage)
+    const allowedBaseDirs = getAllowedBaseDirs();
+
+    const summaryFile = meeting.session_info?.summary_file;
+    const transcriptFile = meeting.session_info?.transcript_file;
+    const audioFile = meeting.session_info?.audio_file;
+    const sessionName = meeting.session_info?.name;
+
+    // Convert relative paths to absolute paths
+    const absolutePaths = [];
+    if (summaryFile) {
+      absolutePaths.push(path.isAbsolute(summaryFile) ? summaryFile : path.join(projectRoot, summaryFile));
+    }
+    if (transcriptFile) {
+      absolutePaths.push(path.isAbsolute(transcriptFile) ? transcriptFile : path.join(projectRoot, transcriptFile));
+    }
+    if (audioFile) {
+      absolutePaths.push(path.isAbsolute(audioFile) ? audioFile : path.join(projectRoot, audioFile));
+    }
+    if (summaryFile && sessionName) {
+      const outputDir = path.dirname(path.isAbsolute(summaryFile) ? summaryFile : path.join(projectRoot, summaryFile));
+      const safeName = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      absolutePaths.push(path.join(outputDir, `${safeName}_notes.txt`));
+    }
+
+    console.log('Attempting to delete files:', absolutePaths);
+
+    let deletedCount = 0;
+    let validationErrors = 0;
+
+    // Delete all related files with path validation
+    for (const file of absolutePaths) {
+      try {
+        // Security: Validate file path is within allowed directories
+        if (!validateSafeFilePath(file, allowedBaseDirs)) {
+          console.error(`Security: Blocked attempt to delete file outside allowed directories: ${file}`);
+          validationErrors++;
+          continue;
+        }
+
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+          deletedCount++;
+          console.log(`Deleted: ${file}`);
+        } else {
+          console.log(`File not found (already deleted?): ${file}`);
+        }
+      } catch (err) {
+        console.warn(`Could not delete ${file}:`, err.message);
+      }
+    }
+
+    if (validationErrors > 0) {
+      return {
+        success: false,
+        error: `Blocked ${validationErrors} file deletion(s) due to security validation`
+      };
+    }
+    
+    return { 
+      success: true, 
+      message: `Deleted meeting and ${deletedCount} associated files` 
+    };
+  } catch (error) {
+    console.error('Delete meeting error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Queue status handler
+ipcMain.handle('get-queue-status', async () => {
+  return {
+    success: true,
+    isProcessing,
+    queueSize: processingQueue.length,
+    currentJob: currentProcessingJob?.sessionName || null,
+    hasRecording: currentRecordingProcess !== null || systemAudioRecordingActive,
+    isPaused: recordingRuntimeState.isPaused,
+    elapsedSeconds: (currentRecordingProcess !== null || systemAudioRecordingActive) ? getRecordingElapsedSeconds() : 0,
+    sessionName: currentRecordingSessionName
+  };
+});
+
+// Synchronously read system_audio_enabled from the user config so
+// start-recording-ui can decide whether to spawn the Python `record`
+// subprocess (off) or let the renderer drive the dual-stream capture (on).
+//
+// Always returns false on macOS without CoreAudio Process Tap support
+// (< 14.4 or non-darwin), regardless of the user's config setting — the
+// Python pipeline is the only working capture path there. Without this
+// gate, a user on older macOS with the new default `true` config would
+// produce no audio at all (Python skipped by main.js, renderer skipped
+// by useSystemAudioCapture's own OS check). Falls through to the config
+// default (currently true on a missing/empty config) when the OS does
+// support CoreAudio Tap so new installs get system audio out of the box.
+function loadSystemAudioEnabled() {
+  if (!isCoreAudioTapSupported()) return false;
+  try {
+    const cfgPath = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'config.json');
+    if (!fs.existsSync(cfgPath)) return true; // new install → CoreAudio default
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    // `false` only when the user has explicitly opted out; an absent key
+    // means "haven't been asked yet" → treat as the new default.
+    return cfg.system_audio_enabled !== false;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Global recording state management
+let systemAudioRecordingActive = false;  // Track system audio recording for tray/quit
+let currentRecordingProcess = null;
+let currentRecordingSessionName = null;  // Surfaced in get-queue-status so renderer knows which meeting is live
+let processingQueue = [];
+let isProcessing = false;
+let currentProcessingJob = null;
+let recordingRuntimeState = {
+  startedAtMs: null,
+  pausedAtMs: null,
+  pausedTotalMs: 0,
+  isPaused: false
+};
+let ollamaProcess = null;  // Track spawned Ollama process for cleanup on quit
+let ollamaPid = null;      // Store PID separately since unref() disconnects the process
+let ollamaStartedByUs = false;
+
+function resetRecordingRuntimeState() {
+  recordingRuntimeState = {
+    startedAtMs: null,
+    pausedAtMs: null,
+    pausedTotalMs: 0,
+    isPaused: false
+  };
+}
+
+function startRecordingRuntimeState() {
+  recordingRuntimeState = {
+    startedAtMs: Date.now(),
+    pausedAtMs: null,
+    pausedTotalMs: 0,
+    isPaused: false
+  };
+}
+
+function markRecordingPaused() {
+  if (!recordingRuntimeState.startedAtMs || recordingRuntimeState.isPaused) {
+    return;
+  }
+  recordingRuntimeState.isPaused = true;
+  recordingRuntimeState.pausedAtMs = Date.now();
+}
+
+function markRecordingResumed() {
+  if (!recordingRuntimeState.isPaused) {
+    return;
+  }
+  if (recordingRuntimeState.pausedAtMs) {
+    recordingRuntimeState.pausedTotalMs += Date.now() - recordingRuntimeState.pausedAtMs;
+  }
+  recordingRuntimeState.isPaused = false;
+  recordingRuntimeState.pausedAtMs = null;
+}
+
+function getRecordingElapsedSeconds() {
+  if (!recordingRuntimeState.startedAtMs) {
+    return 0;
+  }
+
+  let pausedMs = recordingRuntimeState.pausedTotalMs;
+  if (recordingRuntimeState.isPaused && recordingRuntimeState.pausedAtMs) {
+    pausedMs += Date.now() - recordingRuntimeState.pausedAtMs;
+  }
+
+  return Math.max(
+    0,
+    Math.floor((Date.now() - recordingRuntimeState.startedAtMs - pausedMs) / 1000)
+  );
+}
+
+// Processing queue management
+async function processNextInQueue() {
+  if (isProcessing || processingQueue.length === 0) {
+    return;
+  }
+  
+  isProcessing = true;
+  currentProcessingJob = processingQueue.shift();
+  
+  console.log(`🔄 Processing queued job: ${currentProcessingJob.sessionName}`);
+  
+  try {
+    const queueCloudKey = loadCloudApiKey();
+    const queueEnv = queueCloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: queueCloudKey } : undefined;
+    const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
+    if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
+      processArgs.push('--notes', currentProcessingJob.notesFile);
+    }
+
+    await new Promise((resolve, reject) => {
+      const proc = spawn(getBackendPath(), processArgs, {
+        cwd: getBackendCwd(),
+        env: queueEnv
+      });
+
+      let stderrBuf = '';
+      // Captured from `SAVED:<path>` so processing-complete can include
+      // meetingData and the renderer can auto-navigate to the new note.
+      // Without this the renderer-driven (system audio) flow leaves the
+      // user stranded on /meetings/processing after the summary streams in.
+      let savedSummaryFile = null;
+
+      // Timeout: kill process if it runs longer than 30 minutes
+      const procTimeout = setTimeout(() => {
+        console.error('process-streaming timed out after 30 minutes, killing');
+        proc.kill();
+      }, 30 * 60 * 1000);
+
+      proc.on('error', (err) => {
+        clearTimeout(procTimeout);
+        reject(new Error(`process-streaming spawn error: ${err.message}`));
+      });
+
+      proc.stdout.on('data', (data) => {
+        const text = data.toString();
+        // Parse protocol lines
+        text.split('\n').forEach(line => {
+          if (line.startsWith('CHUNK:')) {
+            try {
+              const encoded = line.slice(6);
+              const chunk = Buffer.from(encoded, 'base64').toString('utf-8');
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('summary-chunk', { chunk, sessionName: currentProcessingJob.sessionName });
+              }
+            } catch (e) { console.log('CHUNK decode error:', e.message); }
+          } else if (line.startsWith('TRANSCRIPTION_COMPLETE:')) {
+            sendDebugLog(`Transcription complete (${line.split(':')[1]} chars)`);
+            trackEvent('transcription_completed', { success: true });
+          } else if (line.startsWith('TITLE:')) {
+            const title = line.slice(6);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('summary-title', { title, sessionName: currentProcessingJob.sessionName });
+            }
+          } else if (line === 'STREAM_COMPLETE') {
+            trackEvent('summarization_completed', { success: true });
+          } else if (line.startsWith('SAVED:')) {
+            savedSummaryFile = line.slice(6).trim();
+            sendDebugLog(`Summary saved: ${savedSummaryFile}`);
+          } else if (line.trim()) {
+            sendDebugLog(line.trim());
+          }
+        });
+      });
+
+      proc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) {
+          stderrBuf += msg + '\n';
+          sendDebugLog(`STDERR: ${msg}`);
+        }
+      });
+
+      proc.on('close', (code) => {
+        clearTimeout(procTimeout);
+        if (code === 0) {
+          console.log(`✅ Completed streaming processing: ${currentProcessingJob.sessionName}`);
+          const sessionNameAtClose = currentProcessingJob.sessionName;
+          // Notify frontend that streaming is done and meeting is saved
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('summary-complete', {
+              success: true,
+              sessionName: sessionNameAtClose
+            });
+          }
+          // Look up the saved meeting so we can include meetingData in the
+          // processing-complete event. The renderer's processing-complete
+          // handler navigates to /meetings/<file> only when meetingData is
+          // present — without this the user gets stuck on the processing
+          // page after the summary streams in.
+          runPythonScript('simple_recorder.py', ['list-meetings'], true)
+            .then(meetingsResult => {
+              const allMeetings = JSON.parse(meetingsResult);
+              let processedMeeting = null;
+              if (savedSummaryFile) {
+                processedMeeting = allMeetings.find(
+                  m => m.session_info?.summary_file === savedSummaryFile
+                );
+              }
+              if (!processedMeeting) {
+                processedMeeting = allMeetings.find(
+                  m => m.session_info?.name === sessionNameAtClose
+                );
+              }
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName: sessionNameAtClose,
+                  message: 'Processing completed successfully',
+                  meetingData: processedMeeting
+                });
+              }
+            })
+            .catch(error => {
+              console.error('Error fetching processed meeting:', error);
+              // Fall back to firing without meetingData — frontend will
+              // refresh the list but skip the auto-navigation.
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName: sessionNameAtClose,
+                  message: 'Processing completed successfully'
+                });
+              }
+            });
+          resolve();
+        } else {
+          reject(new Error(`process-streaming exited with code ${code}: ${stderrBuf.slice(-500)}`));
+        }
+      });
+    });
+
+  } catch (error) {
+    console.error(`❌ Processing failed for ${currentProcessingJob.sessionName}:`, error);
+    trackEvent('error_occurred', { error_type: 'processing_queue' });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('processing-complete', {
+        success: false,
+        sessionName: currentProcessingJob.sessionName,
+        error: error.message
+      });
+    }
+  } finally {
+    isProcessing = false;
+    currentProcessingJob = null;
+    // Process next job in queue
+    setTimeout(processNextInQueue, 1000);
+  }
+}
+
+function addToProcessingQueue(audioFile, sessionName, notesFile) {
+  processingQueue.push({ audioFile, sessionName, notesFile });
+  console.log(`📋 Added to processing queue: ${sessionName} (Queue size: ${processingQueue.length})`);
+  processNextInQueue();
+}
+
+ipcMain.handle('start-recording-ui', async (_, sessionName) => {
+  try {
+    if (currentRecordingProcess) {
+      return { success: false, error: 'Recording already in progress' };
+    }
+    if (systemAudioRecordingActive) {
+      return { success: false, error: 'Recording already in progress' };
+    }
+
+    const actualSessionName = sessionName || 'Meeting';
+
+    // Renderer-driven dual-stream path: when system audio is enabled the
+    // renderer (useSystemAudioCapture) captures mic + system loopback and
+    // mixes them in Web Audio. We MUST NOT spawn the Python `record`
+    // subprocess here or we'd produce two parallel recordings → two notes.
+    // The renderer will write its mixed WebM and queue it through the
+    // existing process-system-audio-recording IPC.
+    if (loadSystemAudioEnabled()) {
+      sendDebugLog(`Starting renderer-driven recording (system audio mode): ${actualSessionName}`);
+      currentRecordingSessionName = actualSessionName;
+      startRecordingRuntimeState();
+      // Flip the active flag immediately so the queue handler reports
+      // hasRecording=true on the very next poll. Without this the renderer
+      // hook would see status='idle' (queue says no recording) at the
+      // moment we want it to fire startCapture, and the dual-stream
+      // capture would never start. The renderer's reportSystemAudioState
+      // IPC is then idempotent on success and clears the flag on failure.
+      systemAudioRecordingActive = true;
+      updateTrayIcon(true);
+      trackEvent('recording_started', { recording_mode: 'system_audio' });
+      return {
+        success: true,
+        sessionName: actualSessionName,
+        message: 'Renderer-driven recording started'
+      };
+    }
+
+    // Legacy mic-only path: spawn Python `record` subprocess.
+    console.log('Starting long recording process...');
+    sendDebugLog(`Starting recording process: ${actualSessionName}`);
+    sendDebugLog('$ stenoai record 7200');
+
+    // Start background recording with 2-hour limit
+    // Pass cloud API key via env var for cloud summarization
+    const recordEnv = {};
+    const cloudKey = loadCloudApiKey();
+    if (cloudKey) recordEnv.STENOAI_CLOUD_API_KEY = cloudKey;
+
+    currentRecordingProcess = spawn(getBackendPath(), ['record', '7200', actualSessionName], {
+      cwd: getBackendCwd(),
+      env: Object.keys(recordEnv).length > 0 ? { ...require('process').env, ...recordEnv } : undefined
+    });
+    currentRecordingSessionName = actualSessionName;
+    startRecordingRuntimeState();
+
+    let hasStarted = false;
+    let processingSucceeded = false;
+    let recordedAudioFile = null;
+    // Authoritative pointer to the final summary file once Python finishes
+    // auto-renaming + writing it (emitted as `SAVED:<path>`). Use this in
+    // preference to the name/audio fallbacks since it can't drift.
+    let savedSummaryFile = null;
+
+    currentRecordingProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+
+      // Capture the audio file path when the recording is saved
+      const audioMatch = output.match(/Recording saved:\s*(.+\.wav)/);
+      if (audioMatch) {
+        recordedAudioFile = audioMatch[1].trim();
+      }
+      console.log('Recording stdout:', output);
+
+      // Parse streaming protocol + send to debug panel
+      output.split('\n').forEach(line => {
+        if (line.startsWith('CHUNK:')) {
+          const encoded = line.slice(6);
+          try {
+            const chunk = Buffer.from(encoded, 'base64').toString('utf-8');
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('summary-chunk', { chunk, sessionName: actualSessionName });
+            }
+          } catch (e) { /* ignore decode errors */ }
+        } else if (line.startsWith('TITLE:')) {
+          const title = line.slice(6);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('summary-title', { title, sessionName: actualSessionName });
+          }
+        } else if (line === 'STREAM_COMPLETE') {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('summary-complete', { success: true, sessionName: actualSessionName });
+          }
+        } else if (line.startsWith('SAVED:')) {
+          savedSummaryFile = line.slice(6).trim();
+        } else if (line.trim()) {
+          sendDebugLog(line.trim());
+        }
+      });
+
+      // Background recording process handles complete pipeline - just notify when done
+      if (output.includes('✅ Complete processing finished!')) {
+        processingSucceeded = true;
+        console.log(`🎉 Recording and processing completed for: ${actualSessionName}`);
+        // Notify frontend that everything is done
+        if (mainWindow) {
+          // Get the processed meeting data to send to frontend
+          runPythonScript('simple_recorder.py', ['list-meetings'], true)
+            .then(meetingsResult => {
+              const allMeetings = JSON.parse(meetingsResult);
+              // Prefer the SAVED:<path> pointer Python emits — that's the
+              // exact summary file written this session and survives the
+              // auto-rename. Fall back to name match (only if user kept the
+              // placeholder), then to audio-file basename.
+              let processedMeeting = null;
+              if (savedSummaryFile) {
+                processedMeeting = allMeetings.find(
+                  m => m.session_info?.summary_file === savedSummaryFile,
+                );
+              }
+              if (!processedMeeting) {
+                processedMeeting = allMeetings.find(m => m.session_info?.name === actualSessionName);
+              }
+              if (!processedMeeting && recordedAudioFile) {
+                const audioBasename = path.basename(recordedAudioFile);
+                processedMeeting = allMeetings.find(m =>
+                  m.session_info?.audio_file && path.basename(m.session_info.audio_file) === audioBasename
+                );
+              }
+
+              mainWindow.webContents.send('processing-complete', {
+                success: true,
+                sessionName: actualSessionName,
+                message: 'Recording and processing completed successfully',
+                meetingData: processedMeeting
+              });
+            })
+            .catch(error => {
+              console.error('Error getting processed meeting data:', error);
+              // Fallback - send without meetingData, frontend will refresh
+              mainWindow.webContents.send('processing-complete', {
+                success: true,
+                sessionName: actualSessionName,
+                message: 'Recording and processing completed successfully'
+              });
+            });
+        }
+      }
+
+      // Detect explicit processing failure from backend
+      if (output.includes('❌ Processing pipeline failed')) {
+        processingSucceeded = true; // Prevent duplicate notification from close handler
+        console.error(`Processing failed for: ${actualSessionName}`);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('processing-complete', {
+            success: false,
+            sessionName: actualSessionName,
+            message: 'Processing failed: summarization error (check that Ollama and a model are available)'
+          });
+        }
+      }
+
+      // Don't queue background recordings for additional processing - they handle it themselves!
+
+      if (output.includes('Recording to:') && !hasStarted) {
+        hasStarted = true;
+      }
+    });
+
+    currentRecordingProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      console.log('Recording stderr:', output);
+
+      // Send real-time stderr to debug panel (same as runPythonScript)
+      output.split('\n').forEach(line => {
+        if (line.trim()) sendDebugLog('STDERR: ' + line.trim());
+      });
+    });
+
+    currentRecordingProcess.on('close', (code) => {
+      console.log(`Recording process closed with code ${code}`);
+      sendDebugLog(`Recording process completed with exit code: ${code}`);
+      currentRecordingProcess = null;
+      currentRecordingSessionName = null;
+      resetRecordingRuntimeState();
+      updateTrayIcon(false);
+
+      // If process exited without a success or failure message, notify the user
+      if (!processingSucceeded && hasStarted && mainWindow && !mainWindow.isDestroyed()) {
+        console.error(`Recording process exited (code ${code}) without completing processing`);
+        mainWindow.webContents.send('processing-complete', {
+          success: false,
+          sessionName: actualSessionName,
+          message: `Processing failed unexpectedly (exit code ${code})`
+        });
+      }
+    });
+
+    // Give it time to start
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    if (currentRecordingProcess) {
+      trackEvent('recording_started');
+      updateTrayIcon(true);
+      return { success: true, message: 'Recording started successfully' };
+    } else {
+      return { success: false, error: 'Failed to start recording process' };
+    }
+  } catch (error) {
+    console.error('Start recording UI error:', error.message);
+    currentRecordingProcess = null;
+    currentRecordingSessionName = null;
+    resetRecordingRuntimeState();
+    updateTrayIcon(false);
+    trackEvent('error_occurred', { error_type: 'start_recording_ui' });
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('pause-recording-ui', async () => {
+  try {
+    if (!currentRecordingProcess) {
+      sendDebugLog('Pause failed: No recording process found');
+      return { success: false, error: 'No recording in progress' };
+    }
+
+    console.log('Pausing recording process...');
+    sendDebugLog('Sending SIGUSR1 to pause recording...');
+
+    // Send SIGUSR1 to pause recording (Unix only)
+    if (process.platform !== 'win32') {
+      currentRecordingProcess.kill('SIGUSR1');
+      markRecordingPaused();
+      sendDebugLog('SIGUSR1 sent successfully');
+      return { success: true, message: 'Recording paused' };
+    } else {
+      return { success: false, error: 'Pause not supported on Windows' };
+    }
+  } catch (error) {
+    console.error('Pause recording UI error:', error.message);
+    sendDebugLog(`Pause error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('resume-recording-ui', async () => {
+  try {
+    if (!currentRecordingProcess) {
+      sendDebugLog('Resume failed: No recording process found');
+      return { success: false, error: 'No recording in progress' };
+    }
+
+    console.log('Resuming recording process...');
+    sendDebugLog('Sending SIGUSR2 to resume recording...');
+
+    // Send SIGUSR2 to resume recording (Unix only)
+    if (process.platform !== 'win32') {
+      currentRecordingProcess.kill('SIGUSR2');
+      markRecordingResumed();
+      sendDebugLog('SIGUSR2 sent successfully');
+      return { success: true, message: 'Recording resumed' };
+    } else {
+      return { success: false, error: 'Resume not supported on Windows' };
+    }
+  } catch (error) {
+    console.error('Resume recording UI error:', error.message);
+    sendDebugLog(`Resume error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('stop-recording-ui', async () => {
+  try {
+    // Always clear system-audio active state. The renderer's stopCapture flow
+    // also reports false, but races (renderer already torn down, recorder
+    // errored before reportSystemAudioState) can leave this stuck true and
+    // the UI thinks a recording is still in progress.
+    systemAudioRecordingActive = false;
+
+    if (!currentRecordingProcess) {
+      // Idempotent: clicking stop with no active recording is not an error
+      // (it's a stale-state race). Reset everything and report success so
+      // the renderer can finish its own cleanup.
+      currentRecordingSessionName = null;
+      resetRecordingRuntimeState();
+      updateTrayIcon(false);
+      return { success: true, message: 'No active recording to stop' };
+    }
+
+    console.log('Stopping recording process...');
+
+    // Send SIGTERM to trigger graceful stop and processing
+    currentRecordingProcess.kill('SIGTERM');
+
+    // Don't wait - let the process complete independently
+    // The process will handle: stop recording → transcribe → summarize → exit
+    currentRecordingProcess = null;
+    currentRecordingSessionName = null;
+    resetRecordingRuntimeState();
+    updateTrayIcon(false);
+
+    trackEvent('recording_stopped');
+    return {
+      success: true,
+      message: 'Recording stopped - processing will complete in background'
+    };
+  } catch (error) {
+    console.error('Stop recording UI error:', error.message);
+    currentRecordingProcess = null;
+    currentRecordingSessionName = null;
+    resetRecordingRuntimeState();
+    updateTrayIcon(false);
+    trackEvent('error_occurred', { error_type: 'stop_recording_ui' });
+    return { success: false, error: error.message };
+  }
+});
+
+// Setup IPC handlers
+
+ipcMain.handle('startup-setup-check', async () => {
+  try {
+    console.log('Running startup setup check...');
+    
+    // Use Python backend to check setup
+    const result = await runPythonScript('simple_recorder.py', ['setup-check']);
+    console.log('Setup check result:', result);
+    
+    // Parse the output to determine if setup is complete
+    const allGood = result.includes('🎉 System check passed!');
+    
+    // Extract check results for UI display
+    const lines = result.split('\n');
+    const checks = [];
+    
+    lines.forEach(line => {
+      if (line.includes('✅') || line.includes('❌') || line.includes('⚠️')) {
+        const parts = line.split(/\s{2,}/); // Split on multiple spaces
+        if (parts.length >= 2) {
+          checks.push([parts[0].trim(), parts[1].trim()]);
+        }
+      }
+    });
+    
+    console.log('Parsed checks:', checks);
+    console.log('All good:', allGood);
+    
+    return { 
+      success: true, 
+      allGood,
+      checks
+    };
+  } catch (error) {
+    console.error('Setup check error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('setup-system-check', async () => {
+  try {
+    // Check Python installation
+    const pythonResult = await new Promise((resolve) => {
+      exec('python3 --version', (error, stdout, stderr) => {
+        if (error) {
+          resolve(false);
+        } else {
+          resolve(true);
+        }
+      });
+    });
+    
+    if (!pythonResult) {
+      return { success: false, error: 'Python 3 not found. Please install Python 3.8+' };
+    }
+    
+    // Create required directories - match Python logic for DMG vs development
+    const os = require('os');
+    const currentPath = __dirname;
+    let baseDir;
+    
+    // Detect if running from app bundle (DMG install) or development
+    if (currentPath.includes('StenoAI.app') || currentPath.includes('Applications')) {
+      // DMG/Production: Use Application Support folder
+      baseDir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai');
+    } else {
+      // Development: Use project relative paths  
+      baseDir = path.join(__dirname, '..');
+    }
+    
+    const dirs = ['recordings', 'transcripts', 'output'];
+    
+    for (const dir of dirs) {
+      const dirPath = path.join(baseDir, dir);
+      if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+      }
+    }
+    
+    // Create venv directory if it doesn't exist  
+    const projectRoot = path.join(__dirname, '..');
+    const venvPath = path.join(projectRoot, 'venv');
+    if (!fs.existsSync(venvPath)) {
+      await new Promise((resolve, reject) => {
+        const process = spawn('python3', ['-m', 'venv', 'venv'], {
+          cwd: projectRoot
+        });
+        
+        process.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error('Failed to create virtual environment'));
+          }
+        });
+        
+        process.on('error', reject);
+      });
+    }
+    
+    trackEvent('setup_completed', { step: 'system_check' });
+    return { success: true, message: 'System setup complete - Python and directories ready' };
+  } catch (error) {
+    trackEvent('setup_failed', { step: 'system_check' });
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('setup-ffmpeg', async () => {
+  try {
+    sendDebugLog('$ Checking for existing ffmpeg installation...');
+
+    // Check bundled ffmpeg first (shipped with the app), then system paths
+    const bundledFfmpeg = app.isPackaged
+      ? path.join(process.resourcesPath, 'stenoai', 'ffmpeg')
+      : path.join(__dirname, '..', 'dist', 'stenoai', 'ffmpeg');
+    const ffmpegPaths = [bundledFfmpeg, 'ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+    sendDebugLog(`$ Checking: ${ffmpegPaths.join(', ')}`);
+    let ffmpegPath = null;
+
+    for (const testPath of ffmpegPaths) {
+      try {
+        const found = await new Promise((resolve) => {
+          const proc = spawn(testPath, ['-version'], { timeout: 5000 });
+          proc.on('error', () => resolve(false));
+          proc.on('close', (code) => resolve(code === 0));
+        });
+
+        if (found) {
+          ffmpegPath = testPath;
+          sendDebugLog(`Found ffmpeg at: ${testPath}`);
+          break;
+        }
+      } catch (error) {
+        // Try next path
+        continue;
+      }
+    }
+
+    if (!ffmpegPath) {
+      sendDebugLog('ffmpeg not found in any common locations');
+    }
+    
+    // Install ffmpeg if not present
+    if (!ffmpegPath) {
+      sendDebugLog('ffmpeg not found, checking for Homebrew...');
+      sendDebugLog('$ Checking: brew, /opt/homebrew/bin/brew, /usr/local/bin/brew');
+
+      // First check if Homebrew is installed and get its path
+      const brewPaths = ['brew', '/opt/homebrew/bin/brew', '/usr/local/bin/brew'];
+      let brewPath = null;
+
+      for (const testPath of brewPaths) {
+        try {
+          const found = await new Promise((resolve) => {
+            const proc = spawn(testPath, ['--version'], { timeout: 5000 });
+            proc.on('error', () => resolve(false));
+            proc.on('close', (code) => resolve(code === 0));
+          });
+
+          if (found) {
+            brewPath = testPath;
+            sendDebugLog(`Found Homebrew at: ${testPath}`);
+            break;
+          }
+        } catch (error) {
+          // Try next path
+          continue;
+        }
+      }
+
+      if (!brewPath) {
+        sendDebugLog('Homebrew not found in any common locations');
+      }
+      
+      // Install Homebrew if missing
+      if (!brewPath) {
+        sendDebugLog('Homebrew not found, installing...');
+        sendDebugLog('$ /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
+
+        // Note: This uses the official Homebrew installation script
+        // Using exec here is intentional as this is the documented installation method
+        // The URL is hardcoded and not user-controlled
+        await new Promise((resolve, reject) => {
+          const process = exec('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+               { timeout: 600000 });
+
+          process.stdout.on('data', (data) => {
+            sendDebugLog(data.toString().trim());
+          });
+
+          process.stderr.on('data', (data) => {
+            sendDebugLog('STDERR: ' + data.toString().trim());
+          });
+
+          process.on('close', (code) => {
+            if (code === 0) {
+              sendDebugLog('Homebrew installation completed successfully');
+              resolve();
+            } else {
+              sendDebugLog(`Homebrew installation failed with exit code: ${code}`);
+              reject(new Error('Failed to install Homebrew automatically'));
+            }
+          });
+        });
+
+        // After installing, set brewPath to the default location
+        brewPath = '/opt/homebrew/bin/brew';
+      } else {
+        sendDebugLog('Homebrew found, proceeding with ffmpeg installation...');
+      }
+
+      // Now install ffmpeg via Homebrew using spawn for security
+      sendDebugLog(`$ ${brewPath} install ffmpeg`);
+      await new Promise((resolve, reject) => {
+        const process = spawn(brewPath, ['install', 'ffmpeg'], { timeout: 300000 });
+
+        process.stdout.on('data', (data) => {
+          sendDebugLog(data.toString().trim());
+        });
+
+        process.stderr.on('data', (data) => {
+          sendDebugLog('STDERR: ' + data.toString().trim());
+        });
+
+        process.on('close', (code) => {
+          if (code === 0) {
+            sendDebugLog('ffmpeg installation completed successfully');
+            resolve();
+          } else {
+            sendDebugLog(`ffmpeg installation failed with exit code: ${code}`);
+            reject(new Error('Failed to install ffmpeg via Homebrew'));
+          }
+        });
+
+        process.on('error', (error) => {
+          sendDebugLog(`ffmpeg installation error: ${error.message}`);
+          reject(error);
+        });
+      });
+    } else {
+      sendDebugLog('ffmpeg already installed, skipping installation');
+    }
+    
+    return { success: true, message: 'ffmpeg ready' };
+  } catch (error) {
+    sendDebugLog(`ffmpeg setup failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('setup-python', async () => {
+  try {
+    // Python backend is bundled via PyInstaller - no setup needed
+    sendDebugLog('Python backend is bundled, skipping setup');
+    return { success: true, message: 'Python backend bundled' };
+
+    // Legacy code below - kept for reference but never runs
+    const projectRoot = path.join(__dirname, '..');
+    const venvPath = path.join(projectRoot, 'venv');
+
+    sendDebugLog(`Working directory: ${projectRoot}`);
+    
+    // Create virtual environment if it doesn't exist
+    if (!fs.existsSync(venvPath)) {
+      sendDebugLog('Python virtual environment not found, creating...');
+      sendDebugLog('$ python3 -m venv venv');
+      
+      await new Promise((resolve, reject) => {
+        const process = spawn('python3', ['-m', 'venv', 'venv'], {
+          cwd: projectRoot,
+          stdio: 'pipe'
+        });
+        
+        process.stdout.on('data', (data) => {
+          sendDebugLog(data.toString().trim());
+        });
+        
+        process.stderr.on('data', (data) => {
+          sendDebugLog('STDERR: ' + data.toString().trim());
+        });
+        
+        process.on('close', (code) => {
+          if (code === 0) {
+            sendDebugLog('Virtual environment created successfully');
+            resolve();
+          } else {
+            sendDebugLog(`Virtual environment creation failed with exit code: ${code}`);
+            reject(new Error('Failed to create virtual environment'));
+          }
+        });
+        
+        process.on('error', (error) => {
+          sendDebugLog(`Process error: ${error.message}`);
+          reject(error);
+        });
+      });
+    } else {
+      sendDebugLog('Python virtual environment already exists');
+    }
+    
+    // Install requirements including Whisper
+    sendDebugLog('Installing Python dependencies...');
+    sendDebugLog('$ pip install -r requirements.txt openai-whisper');
+    
+    return new Promise((resolve) => {
+      const pythonPath = path.join(venvPath, 'bin', 'python');
+      const process = spawn(pythonPath, ['-m', 'pip', 'install', '-r', 'requirements.txt', 'openai-whisper'], {
+        cwd: projectRoot,
+        stdio: 'pipe'
+      });
+      
+      let output = '';
+      
+      process.stdout.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) {
+          sendDebugLog(text);
+          output += text;
+        }
+      });
+      
+      process.stderr.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) {
+          sendDebugLog('STDERR: ' + text);
+          output += text;
+        }
+      });
+      
+      process.on('close', (code) => {
+        if (code === 0) {
+          sendDebugLog('Python dependencies installation completed successfully');
+          trackEvent('setup_completed', { step: 'python_dependencies' });
+          resolve({ success: true, message: 'Python dependencies and Whisper installed' });
+        } else {
+          sendDebugLog(`Python dependencies installation failed with exit code: ${code}`);
+          trackEvent('setup_failed', { step: 'python_dependencies' });
+          resolve({ success: false, error: `Installation failed: ${output}` });
+        }
+      });
+      
+      process.on('error', (error) => {
+        resolve({ success: false, error: `Process error: ${error.message}` });
+      });
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// ── Auto-updater ──
+function setupAutoUpdater() {
+  if (IS_E2E) {
+    sendDebugLog('Auto-updater: skipped (E2E mode)');
+    return;
+  }
+  // Don't check for updates in dev mode
+  if (!app.isPackaged) {
+    sendDebugLog('Auto-updater: skipped (dev mode)');
+    return;
+  }
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    sendDebugLog('Auto-updater: checking for updates...');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    sendDebugLog(`Auto-updater: update available (v${info.version})`);
+    if (mainWindow) {
+      mainWindow.webContents.send('update-available', { version: info.version });
+    }
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    sendDebugLog('Auto-updater: up to date');
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    sendDebugLog(`Auto-updater: downloading ${Math.round(progress.percent)}%`);
+    if (mainWindow) {
+      mainWindow.webContents.send('update-download-progress', { percent: Math.round(progress.percent) });
+    }
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    sendDebugLog(`Auto-updater: v${info.version} ready to install`);
+    if (mainWindow) {
+      mainWindow.webContents.send('update-downloaded', { version: info.version });
+    }
+  });
+
+  autoUpdater.on('error', (err) => {
+    sendDebugLog(`Auto-updater error: ${err.message}`);
+  });
+
+  // Check on launch (after a short delay to not block startup)
+  setTimeout(() => {
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, 10000);
+
+  // Re-check every 30 minutes
+  setInterval(() => {
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, 30 * 60 * 1000);
+}
+
+ipcMain.on('install-update', () => {
+  // Bypass the mainWindow 'close' handler's preventDefault+hide so that
+  // quitAndInstall's window-close step actually quits the app. Without this
+  // the app just minimises and Squirrel never gets to apply the update.
+  isQuitting = true;
+  autoUpdater.quitAndInstall(false, true);
+});
+
+// Add IPC handler for sending debug logs to frontend
+function sendDebugLog(message) {
+  // Send to main window (both setup console and debug panel)
+  if (mainWindow) {
+    mainWindow.webContents.send('debug-log', message);
+  }
+}
+
+ipcMain.handle('setup-ollama-and-model', async () => {
+  try {
+    // Check AI provider -- skip local Ollama setup for remote/cloud
+    try {
+      const providerResult = await runPythonScript('simple_recorder.py', ['get-ai-provider'], true);
+      const providerConfig = JSON.parse(providerResult.trim());
+      if (providerConfig.ai_provider === 'remote' || providerConfig.ai_provider === 'cloud') {
+        sendDebugLog(`AI provider is "${providerConfig.ai_provider}" -- skipping local Ollama setup`);
+        return { success: true, skipped: true };
+      }
+    } catch (e) {
+      sendDebugLog(`Could not read AI provider, proceeding with local setup: ${e.message}`);
+    }
+
+    // Check macOS version — bundled Ollama requires macOS 14 (Sonoma) or later
+    const macosRelease = os.release(); // e.g. "23.1.0" for macOS 14.1
+    const darwinMajor = parseInt(macosRelease.split('.')[0], 10);
+    // Darwin 23 = macOS 14 (Sonoma), Darwin 22 = macOS 13 (Ventura), etc.
+    if (darwinMajor < 23) {
+      const macosVersion = darwinMajor >= 22 ? '13 (Ventura)' : darwinMajor >= 21 ? '12 (Monterey)' : `(Darwin ${darwinMajor})`;
+      sendDebugLog(`macOS ${macosVersion} detected — Ollama requires macOS 14 (Sonoma) or later`);
+      return { success: false, error: 'StenoAI requires macOS 14 (Sonoma) or later for local AI summarization. Please update your macOS or use a remote Ollama server in Settings.' };
+    }
+
+    sendDebugLog('Locating bundled Ollama...');
+    const finalOllamaPath = await findOllamaExecutable();
+    if (!finalOllamaPath) {
+      sendDebugLog('Error: Bundled Ollama not found');
+      return { success: false, error: 'Bundled Ollama not found. Please reinstall StenoAI.' };
+    }
+    sendDebugLog(`Found bundled Ollama at: ${finalOllamaPath}`);
+
+    // Reuse already-running Ollama if its API is reachable on 11434.
+    // Avoids "address already in use" when the user (or a previous launch)
+    // already has Ollama up.
+    const httpProbe = require('http');
+    const ollamaAlreadyRunning = await new Promise((resolve) => {
+      const req = httpProbe.get('http://127.0.0.1:11434/api/tags', { timeout: 1500 }, (res) => {
+        resolve(res.statusCode === 200);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+    if (ollamaAlreadyRunning) {
+      sendDebugLog('Ollama already running on 127.0.0.1:11434 — reusing existing instance');
+    }
+
+    let ollamaExited = false;
+    let ollamaExitCode = null;
+    let ollamaDyldError = false;
+    if (!ollamaAlreadyRunning) {
+      sendDebugLog('Starting Ollama service...');
+      sendDebugLog(`$ ${finalOllamaPath} serve`);
+      ollamaProcess = spawn(finalOllamaPath, ['serve'], { detached: true, stdio: ['ignore', 'ignore', 'pipe'], env: getOllamaEnv() });
+      ollamaPid = ollamaProcess.pid;
+      // Write PID file so quit handler can find the process
+      try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
+      ollamaProcess.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) sendDebugLog(`Ollama: ${msg}`);
+        if (msg.includes('Symbol not found') || msg.includes('dyld')) ollamaDyldError = true;
+      });
+      ollamaProcess.on('exit', (code) => {
+        ollamaExited = true;
+        ollamaExitCode = code;
+        ollamaPid = null;
+        if (code !== 0 && code !== null) {
+          sendDebugLog(`Ollama process exited with code ${code}`);
+        }
+      });
+      ollamaProcess.unref();
+      ollamaStartedByUs = true;
+    }
+
+    // Wait for Ollama to be ready (poll with early exit detection).
+    // When we reused an existing instance, skip the wait — it's already up.
+    sendDebugLog('Waiting for Ollama service to be ready...');
+    const maxAttempts = ollamaAlreadyRunning ? 1 : 30;
+    let ready = ollamaAlreadyRunning;
+    for (let i = 0; i < maxAttempts && !ready; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (ollamaExited) {
+        sendDebugLog(`Ollama process died during startup (exit code: ${ollamaExitCode})`);
+        break;
+      }
+      try {
+        const http = require('http');
+        ready = await new Promise((resolve) => {
+          const req = http.get('http://127.0.0.1:11434/api/tags', { timeout: 2000 }, (res) => {
+            resolve(res.statusCode === 200);
+          });
+          req.on('error', () => resolve(false));
+          req.on('timeout', () => { req.destroy(); resolve(false); });
+        });
+        if (ready) {
+          sendDebugLog(`Ollama ready after ${i + 1} seconds`);
+          break;
+        }
+      } catch (e) {
+        // Continue polling
+      }
+    }
+
+    if (!ready) {
+      if (ollamaExited) {
+        if (ollamaDyldError) {
+          return { success: false, error: 'Ollama crashed due to incompatible macOS version. StenoAI requires macOS 14 (Sonoma) or later for local AI. Please update macOS or use a remote Ollama server in Settings.' };
+        }
+        return { success: false, error: `Ollama failed to start (exit code: ${ollamaExitCode}). Check debug logs for details.` };
+      }
+      sendDebugLog('Warning: Ollama may not be fully ready, attempting pull anyway...');
+    }
+    
+    sendDebugLog('Downloading AI model (this may take several minutes)...');
+    sendDebugLog('POST http://127.0.0.1:11434/api/pull {name: "llama3.2:3b"}');
+
+    const http = require('http');
+    return new Promise((resolve) => {
+      const postData = JSON.stringify({ name: 'llama3.2:3b' });
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: 11434,
+        path: '/api/pull',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 600000
+      }, (res) => {
+        let lastStatus = '';
+        res.on('data', (chunk) => {
+          // Ollama streams newline-delimited JSON
+          const lines = chunk.toString().split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const json = JSON.parse(line);
+              if (json.error) {
+                sendDebugLog(`Pull error: ${json.error}`);
+                return;
+              }
+              // Log progress without spamming duplicate status
+              const status = json.status || '';
+              if (json.total && json.completed) {
+                const pct = Math.round((json.completed / json.total) * 100);
+                const msg = `${status} ${pct}%`;
+                if (msg !== lastStatus) {
+                  sendDebugLog(msg);
+                  lastStatus = msg;
+                }
+              } else if (status !== lastStatus) {
+                sendDebugLog(status);
+                lastStatus = status;
+              }
+            } catch (e) {
+              // Non-JSON line, log as-is
+              sendDebugLog(chunk.toString().trim());
+            }
+          }
+        });
+
+        res.on('end', async () => {
+          if (res.statusCode === 200) {
+            sendDebugLog('AI model download completed successfully');
+            try {
+              await runPythonScript('simple_recorder.py', ['set-model', 'llama3.2:3b'], true);
+            } catch (e) {
+              // Non-fatal -- config reset is best-effort
+            }
+            trackEvent('setup_completed', { step: 'ollama_and_model' });
+            resolve({ success: true, message: 'Ollama and AI model ready' });
+          } else {
+            sendDebugLog(`AI model download failed with status: ${res.statusCode}`);
+            trackEvent('setup_failed', { step: 'ollama_and_model' });
+            resolve({ success: false, error: 'Failed to download AI model', details: `HTTP ${res.statusCode}` });
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        sendDebugLog(`Pull request error: ${error.message}`);
+        resolve({ success: false, error: 'Failed to download AI model', details: error.message });
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        sendDebugLog('Model pull timed out after 10 minutes');
+        resolve({ success: false, error: 'Model download timed out' });
+      });
+
+      req.write(postData);
+      req.end();
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('setup-whisper', async () => {
+  try {
+    // Download whisper model using the bundled backend
+    const backendPath = getBackendPath();
+    sendDebugLog('Downloading Whisper transcription model (~500MB)...');
+    sendDebugLog(`$ ${backendPath} download-whisper-model`);
+
+    return new Promise((resolve) => {
+      const process = spawn(backendPath, ['download-whisper-model'], {
+        stdio: 'pipe'
+      });
+
+      process.stdout.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) sendDebugLog(text);
+      });
+
+      process.stderr.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) sendDebugLog('STDERR: ' + text);
+      });
+
+      process.on('close', (code) => {
+        if (code === 0) {
+          sendDebugLog('Whisper model downloaded successfully');
+          resolve({ success: true, message: 'Whisper model ready' });
+        } else {
+          sendDebugLog(`Whisper model download failed with exit code: ${code}`);
+          resolve({ success: false, error: 'Failed to download Whisper model' });
+        }
+      });
+
+      process.on('error', (error) => {
+        sendDebugLog(`Process error: ${error.message}`);
+        resolve({ success: false, error: error.message });
+      });
+    });
+
+    // Legacy code below - kept for reference but never runs
+    const projectRoot = path.join(__dirname, '..');
+    const pythonPath = path.join(projectRoot, 'venv', 'bin', 'python');
+
+    sendDebugLog('Installing Whisper speech recognition...');
+    sendDebugLog(`$ ${pythonPath} -m pip install openai-whisper`);
+    
+    return new Promise((resolve) => {
+      const process = spawn(pythonPath, ['-m', 'pip', 'install', 'openai-whisper'], {
+        cwd: projectRoot,
+        stdio: 'pipe'
+      });
+      
+      let output = '';
+      
+      process.stdout.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) {
+          sendDebugLog(text);
+          output += text;
+        }
+      });
+      
+      process.stderr.on('data', (data) => {
+        const text = data.toString().trim();
+        if (text) {
+          sendDebugLog('STDERR: ' + text);
+          output += text;
+        }
+      });
+      
+      process.on('close', (code) => {
+        if (code === 0) {
+          sendDebugLog('Whisper installation completed successfully');
+          resolve({ success: true, message: 'Whisper installed successfully' });
+        } else {
+          sendDebugLog(`Whisper installation failed with exit code: ${code}`);
+          resolve({ success: false, error: `Whisper installation failed: ${output}` });
+        }
+      });
+      
+      process.on('error', (error) => {
+        resolve({ success: false, error: `Process error: ${error.message}` });
+      });
+    });
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('setup-test', async () => {
+  try {
+    sendDebugLog('Running system test...');
+    sendDebugLog('$ python simple_recorder.py test');
+    
+    // Test the complete system
+    const result = await runPythonScript('simple_recorder.py', ['test']);
+    
+    // Log the full result to debug console
+    result.split('\n').forEach(line => {
+      if (line.trim()) sendDebugLog(line.trim());
+    });
+    
+    if (result.includes('System check passed') || result.includes('SUCCESS')) {
+      sendDebugLog('System test completed successfully');
+      trackEvent('setup_completed', { step: 'system_test' });
+      return { success: true, message: 'System test passed' };
+    } else {
+      // Extract specific error details from the output
+      const errorLines = result.split('\n').filter(line => line.includes('ERROR:'));
+      const specificError = errorLines.length > 0 ? errorLines[errorLines.length - 1].replace('ERROR: ', '') : 'Unknown error';
+      sendDebugLog(`System test failed: ${specificError}`);
+      trackEvent('setup_failed', { step: 'system_test' });
+      return { success: false, error: `System test failed: ${specificError}`, details: result };
+    }
+  } catch (error) {
+    sendDebugLog(`System test error: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// Settings window IPC handlers  
+ipcMain.handle('trigger-setup-wizard', async () => {
+  try {
+    console.log('🔧 Starting setup wizard from settings...');
+    
+    // Trigger the main window's setup flow
+    if (mainWindow) {
+      mainWindow.webContents.send('trigger-setup-flow');
+    }
+    
+    return { success: true, message: 'Setup wizard triggered in main window' };
+  } catch (error) {
+    console.error('Setup wizard failed:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-app-version', async () => {
+  try {
+    const packagePath = path.join(__dirname, 'package.json');
+    const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+    return {
+      success: true,
+      version: packageContent.version,
+      name: packageContent.productName || packageContent.name
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Storage path handlers
+ipcMain.handle('get-storage-path', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-storage-path'], true);
+    const jsonData = JSON.parse(result.trim());
+    // Python only returns the user's custom path (empty string when not set).
+    // Augment with the platform default so the renderer can show "where your
+    // data actually lives" without hardcoding the path. custom_path mirrors
+    // storage_path but is null when empty for cleaner conditionals.
+    const customPath = jsonData.storage_path && jsonData.storage_path.trim()
+      ? jsonData.storage_path
+      : null;
+    const defaultPath = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai');
+    return {
+      success: true,
+      storage_path: customPath || defaultPath,
+      custom_path: customPath,
+      default_path: defaultPath,
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-storage-path', async (event, storagePath) => {
+  try {
+    const args = ['set-storage-path'];
+    if (storagePath) {
+      args.push(storagePath);
+    }
+    const result = await runPythonScript('simple_recorder.py', args);
+    // Update cached custom path for file validation
+    _cachedCustomStoragePath = storagePath || null;
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    return { success: true, storage_path: storagePath };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('select-storage-folder', async () => {
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Choose storage location for StenoAI data',
+      buttonLabel: 'Select Folder'
+    });
+
+    if (!result.canceled && result.filePaths.length > 0) {
+      return { success: true, folderPath: result.filePaths[0] };
+    }
+    return { success: false, error: 'No folder selected' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Folder management handlers
+ipcMain.handle('list-folders', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['list-folders'], true);
+    return { success: true, ...JSON.parse(result.trim()) };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('create-folder', async (event, name, color) => {
+  try {
+    const args = ['create-folder', name];
+    if (color) args.push('--color', color);
+    const result = await runPythonScript('simple_recorder.py', args);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('rename-folder', async (event, folderId, name) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['rename-folder', folderId, name]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('update-folder-icon', async (event, folderId, icon) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['update-folder-icon', folderId, icon]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('delete-folder', async (event, folderId) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['delete-folder', folderId]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('reorder-folders', async (event, folderIds) => {
+  try {
+    const args = ['reorder-folders', ...folderIds];
+    const result = await runPythonScript('simple_recorder.py', args);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('add-meeting-to-folder', async (event, summaryFile, folderId) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['add-meeting-to-folder', summaryFile, folderId]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('remove-meeting-from-folder', async (event, summaryFile, folderId) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['remove-meeting-from-folder', summaryFile, folderId]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-ai-prompts', async () => {
+  try {
+    // Read the summarization prompt from the Python backend
+    const summarizerPath = path.join(__dirname, '..', 'src', 'summarizer.py');
+    
+    if (fs.existsSync(summarizerPath)) {
+      const content = fs.readFileSync(summarizerPath, 'utf8');
+      
+      // Extract the full prompt from the _create_permissive_prompt method
+      const promptMatch = content.match(/def _create_permissive_prompt[\s\S]*?return f"""([\s\S]*?)"""/);
+      
+      if (promptMatch) {
+        return {
+          success: true,
+          summarization: promptMatch[1].trim()
+        };
+      }
+    }
+    
+    return {
+      success: true,
+      summarization: 'Prompt not found in summarizer.py'
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Helper function to ensure Ollama service is running
+async function ensureOllamaRunning() {
+  try {
+    // Check if Ollama service is responding
+    const http = require('http');
+    const response = await new Promise((resolve) => {
+      const req = http.get('http://127.0.0.1:11434/api/version', { timeout: 3000 }, (res) => {
+        resolve(res.statusCode === 200);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+
+    if (response) {
+      return true; // Service is running
+    }
+
+    // Service not running, try to start it
+    // Check macOS version — bundled Ollama requires macOS 14 (Sonoma) or later
+    const macRelease = os.release();
+    if (parseInt(macRelease.split('.')[0], 10) < 23) {
+      sendDebugLog('macOS version too old for bundled Ollama — requires macOS 14 (Sonoma) or later');
+      return false;
+    }
+
+    const ollamaPath = await findOllamaExecutable();
+    if (!ollamaPath) {
+      return false;
+    }
+
+    // Start Ollama service in background with proper env vars for dylibs
+    ollamaProcess = spawn(ollamaPath, ['serve'], { detached: true, stdio: 'ignore', env: getOllamaEnv() });
+    ollamaPid = ollamaProcess.pid;
+    try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
+    ollamaProcess.on('exit', () => { ollamaPid = null; });
+    ollamaProcess.unref();
+    ollamaStartedByUs = true;
+
+    // Wait for service to start
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    return true;
+  } catch (error) {
+    console.error('Error ensuring Ollama is running:', error);
+    return false;
+  }
+}
+
+// Check if Ollama is installed (for setup wizard)
+ipcMain.handle('check-ollama-installed', async () => {
+  try {
+    const ollamaPath = await findOllamaExecutable();
+    if (!ollamaPath) {
+      return { success: true, installed: false };
+    }
+    return { success: true, installed: true, path: ollamaPath };
+  } catch (error) {
+    return { success: false, installed: false, error: error.message };
+  }
+});
+
+// Model management handlers
+ipcMain.handle('check-model-installed', async (event, modelName) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['check-model', modelName]);
+    // Parse the last JSON line from output (skip any log lines)
+    const lines = result.trim().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const data = JSON.parse(lines[i]);
+        return { success: true, installed: data.installed };
+      } catch (e) {
+        continue;
+      }
+    }
+    return { success: false, installed: false, error: 'Could not parse backend response' };
+  } catch (error) {
+    return { success: false, installed: false, error: error.message };
+  }
+});
+
+ipcMain.handle('list-models', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['list-models']);
+    const jsonData = JSON.parse(result);
+
+    return {
+      success: true,
+      ...jsonData
+    };
+  } catch (error) {
+    sendDebugLog(`Error listing models: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-current-model', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-model']);
+    const jsonData = JSON.parse(result);
+
+    return {
+      success: true,
+      ...jsonData
+    };
+  } catch (error) {
+    sendDebugLog(`Error getting current model: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-model', async (event, modelName) => {
+  try {
+    sendDebugLog(`Setting model to: ${modelName}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-model', modelName]);
+
+    // Extract JSON from output (might have other text before it)
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const jsonData = JSON.parse(jsonMatch[0]);
+      trackEvent('model_changed', { model: modelName });
+      return jsonData;
+    }
+
+    trackEvent('model_changed', { model: modelName });
+    return { success: true, model: modelName };
+  } catch (error) {
+    sendDebugLog(`Error setting model: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+
+
+ipcMain.handle('get-whisper-model', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-whisper-model'], true);
+    return JSON.parse(result.trim());
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('set-whisper-model', async (event, modelSize) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-whisper-model', modelSize]);
+    return JSON.parse(result.trim());
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-keep-recordings', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-keep-recordings'], true);
+    return JSON.parse(result.trim());
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('set-keep-recordings', async (event, enabled) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-keep-recordings', enabled.toString()]);
+    return JSON.parse(result.trim());
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-notifications', handleGetNotifications);
+
+ipcMain.handle('set-notifications', async (event, enabled) => {
+  try {
+    sendDebugLog(`Setting notifications to: ${enabled}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-notifications', enabled ? 'True' : 'False']);
+
+    // Extract JSON from output
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const jsonData = JSON.parse(jsonMatch[0]);
+      return jsonData;
+    }
+
+    return { success: true, notifications_enabled: enabled };
+  } catch (error) {
+    sendDebugLog(`Error setting notifications: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-telemetry', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-telemetry']);
+    const jsonData = JSON.parse(result);
+
+    return {
+      success: true,
+      ...jsonData
+    };
+  } catch (error) {
+    sendDebugLog(`Error getting telemetry settings: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-telemetry', async (event, enabled) => {
+  try {
+    sendDebugLog(`Setting telemetry to: ${enabled}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-telemetry', enabled ? 'True' : 'False']);
+
+    // Update in-memory state
+    telemetryEnabled = enabled;
+
+    if (enabled && !posthogClient) {
+      posthogClient = new PostHog(POSTHOG_API_KEY, { host: POSTHOG_HOST });
+      console.log('Telemetry re-enabled');
+    } else if (!enabled && posthogClient) {
+      await shutdownTelemetry();
+      console.log('Telemetry disabled');
+    }
+
+    // Extract JSON from output
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const jsonData = JSON.parse(jsonMatch[0]);
+      return jsonData;
+    }
+
+    return { success: true, telemetry_enabled: enabled };
+  } catch (error) {
+    sendDebugLog(`Error setting telemetry: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// Hide dock icon IPC handlers
+ipcMain.handle('get-dock-icon', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-dock-icon']);
+    const jsonData = JSON.parse(result);
+
+    return {
+      success: true,
+      ...jsonData
+    };
+  } catch (error) {
+    sendDebugLog(`Error getting dock icon settings: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-dock-icon', async (event, hidden) => {
+  try {
+    sendDebugLog(`Setting hide dock icon to: ${hidden}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-dock-icon', hidden ? 'True' : 'False']);
+
+    // Apply immediately
+    if (process.platform === 'darwin' && app.dock) {
+      if (hidden) {
+        app.dock.hide();
+      } else {
+        app.dock.show();
+      }
+    }
+
+    // Extract JSON from output
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const jsonData = JSON.parse(jsonMatch[0]);
+      return jsonData;
+    }
+
+    return { success: true, hide_dock_icon: hidden };
+  } catch (error) {
+    sendDebugLog(`Error setting dock icon: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// System audio capture IPC handlers
+ipcMain.handle('get-system-audio', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-system-audio'], true);
+    const jsonData = JSON.parse(result);
+    return { success: true, ...jsonData };
+  } catch (error) {
+    sendDebugLog(`Error getting system audio setting: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-system-audio', async (event, enabled) => {
+  try {
+    sendDebugLog(`Setting system audio to: ${enabled}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-system-audio', enabled ? 'True' : 'False']);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    return { success: true, system_audio_enabled: enabled };
+  } catch (error) {
+    sendDebugLog(`Error setting system audio: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// Language IPC handlers
+ipcMain.handle('get-language', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-language'], true);
+    const jsonData = JSON.parse(result);
+    return { success: true, ...jsonData };
+  } catch (error) {
+    sendDebugLog(`Error getting language setting: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-language', async (event, languageCode) => {
+  try {
+    sendDebugLog(`Setting language to: ${languageCode}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-language', languageCode]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    return { success: true, language: languageCode };
+  } catch (error) {
+    sendDebugLog(`Error setting language: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-user-name', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-user-name'], true);
+    const jsonData = JSON.parse(result.trim());
+    return { success: true, ...jsonData };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-user-name', async (event, name) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-user-name', String(name ?? '')]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true, user_name: String(name ?? '').trim() };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// AI Provider IPC handlers
+
+function getCloudKeyPath() {
+  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.cloud-api-key');
+}
+
+function saveCloudApiKey(key) {
+  try {
+    const keyDir = path.dirname(getCloudKeyPath());
+    if (!fs.existsSync(keyDir)) {
+      fs.mkdirSync(keyDir, { recursive: true });
+    }
+    const encrypted = safeStorage.encryptString(key);
+    fs.writeFileSync(getCloudKeyPath(), encrypted);
+    return true;
+  } catch (error) {
+    console.error('Failed to save cloud API key:', error.message);
+    return false;
+  }
+}
+
+function loadCloudApiKey() {
+  try {
+    const keyPath = getCloudKeyPath();
+    if (!fs.existsSync(keyPath)) return null;
+    const encrypted = fs.readFileSync(keyPath);
+    return safeStorage.decryptString(encrypted);
+  } catch (error) {
+    console.error('Failed to load cloud API key:', error.message);
+    return null;
+  }
+}
+
+function hasCloudApiKey() {
+  return fs.existsSync(getCloudKeyPath());
+}
+
+ipcMain.handle('get-ai-provider', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-ai-provider'], true);
+    const jsonData = JSON.parse(result.trim());
+    // Override cloud_api_key_set with safeStorage check
+    jsonData.cloud_api_key_set = hasCloudApiKey();
+    return { success: true, ...jsonData };
+  } catch (error) {
+    sendDebugLog(`Error getting AI provider: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-ai-provider', async (event, provider) => {
+  try {
+    sendDebugLog(`Setting AI provider to: ${provider}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-ai-provider', provider]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true, ai_provider: provider };
+  } catch (error) {
+    sendDebugLog(`Error setting AI provider: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-remote-ollama-url', async (event, url) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-remote-ollama-url', url]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-cloud-api-url', async (event, url) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-cloud-api-url', url]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-cloud-api-key', async (event, key) => {
+  try {
+    const saved = saveCloudApiKey(key);
+    return { success: saved, cloud_api_key_set: saved };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-cloud-provider', async (event, provider) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-cloud-provider', provider]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('set-cloud-model', async (event, model) => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-cloud-model', model]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('test-remote-ollama', async (event, url) => {
+  try {
+    sendDebugLog(`Testing remote Ollama at: ${url}`);
+    const result = await runPythonScript('simple_recorder.py', ['test-remote-ollama', url]);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: false, error: 'No response' };
+  } catch (error) {
+    sendDebugLog(`Remote Ollama test failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('test-cloud-api', async () => {
+  try {
+    sendDebugLog('Testing cloud API connection...');
+    const apiKey = loadCloudApiKey();
+    const env = apiKey ? { STENOAI_CLOUD_API_KEY: apiKey } : {};
+    const result = await runPythonScript('simple_recorder.py', ['test-cloud-api'], false, env);
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+    return { success: false, error: 'No response' };
+  } catch (error) {
+    sendDebugLog(`Cloud API test failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-recordings-dir', async () => {
+  try {
+    // Get recordings directory from Python config
+    const result = await runPythonScript('simple_recorder.py', ['get-storage-path'], true);
+    const jsonData = JSON.parse(result.trim());
+
+    let recordingsDir;
+    if (jsonData.storage_path) {
+      recordingsDir = path.join(jsonData.storage_path, 'recordings');
+    } else if (app.isPackaged) {
+      recordingsDir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'recordings');
+    } else {
+      recordingsDir = path.join(__dirname, '..', 'recordings');
+    }
+
+    // Ensure directory exists
+    if (!fs.existsSync(recordingsDir)) {
+      fs.mkdirSync(recordingsDir, { recursive: true });
+    }
+
+    return { success: true, path: recordingsDir };
+  } catch (error) {
+    sendDebugLog(`Error getting recordings dir: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// Renderer-driven system audio capture writes its WebM/Opus blob here so it
+// lands inside an allowedBaseDir for validateSafeFilePath downstream. The
+// blob comes over IPC as a Uint8Array (structured-clone friendly).
+ipcMain.handle('write-system-audio-blob', async (_event, payload, sessionName) => {
+  try {
+    const dir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'system_audio_tmp');
+    fs.mkdirSync(dir, { recursive: true });
+    const safeName = String(sessionName || 'Meeting').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    const filename = `sysaudio-${Date.now()}-${safeName}.webm`;
+    const filePath = path.join(dir, filename);
+    const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+    fs.writeFileSync(filePath, buf);
+    sendDebugLog(`[sysaudio] wrote blob ${filename} (${buf.length} bytes)`);
+    return { success: true, filePath };
+  } catch (error) {
+    sendDebugLog(`Error writing system audio blob: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {
+  try {
+    sendDebugLog(`Queuing system audio recording for processing: ${audioFilePath}`);
+
+    // Validate file path
+    const allowedBaseDirs = getAllowedBaseDirs();
+    if (!validateSafeFilePath(audioFilePath, allowedBaseDirs)) {
+      return { success: false, error: 'Invalid file path' };
+    }
+
+    if (!fs.existsSync(audioFilePath)) {
+      return { success: false, error: 'Audio file not found' };
+    }
+
+    const actualSessionName = sessionName || 'Meeting';
+
+    // Check for user notes file
+    const safeName = actualSessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const notesFile = path.join(getBackendCwd(), '_internal', 'output', `${safeName}_notes.txt`);
+    const notesPath = fs.existsSync(notesFile) ? notesFile : undefined;
+
+    // Use the existing processing queue to avoid concurrent Ollama/Whisper runs
+    addToProcessingQueue(audioFilePath, actualSessionName, notesPath);
+
+    trackEvent('recording_stopped', { recording_mode: 'system_audio' });
+    return { success: true, message: 'Added to processing queue' };
+  } catch (error) {
+    sendDebugLog(`Error queuing system audio: ${error.message}`);
+    trackEvent('error_occurred', { error_type: 'process_system_audio' });
+    return { success: false, error: error.message };
+  }
+});
+
+// Track system audio recording state for tray icon. Also resets the elapsed
+// counter when the renderer reports inactive without a Python process —
+// covers the case where startCapture failed (permission denied) and we'd
+// otherwise leak recordingRuntimeState.startedAtMs.
+ipcMain.on('system-audio-recording-state', (event, isRecording) => {
+  sendDebugLog(`[sysaudio] state -> ${isRecording ? 'true' : 'false'} (was ${systemAudioRecordingActive})`);
+  systemAudioRecordingActive = isRecording;
+  if (!isRecording && !currentRecordingProcess) {
+    resetRecordingRuntimeState();
+    currentRecordingSessionName = null;
+  }
+  updateTrayIcon(isRecording);
+  updateTrayMenu();
+});
+
+ipcMain.handle('pull-model', async (event, modelName) => {
+  try {
+    sendDebugLog(`Pulling model: ${modelName}`);
+    sendDebugLog('This may take several minutes...');
+
+    return new Promise((resolve) => {
+      const proc = spawn(getBackendPath(), ['pull-model', modelName], {
+        cwd: getBackendCwd()
+      });
+
+      let lastStdoutLine = '';
+
+      proc.stdout.on('data', (data) => {
+        const output = data.toString().trim();
+        sendDebugLog(output);
+        if (output) lastStdoutLine = output;
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('model-pull-progress', {
+            model: modelName,
+            progress: output
+          });
+        }
+      });
+
+      proc.stderr.on('data', (data) => {
+        const output = data.toString().trim();
+        sendDebugLog(output);
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('model-pull-progress', {
+            model: modelName,
+            progress: output
+          });
+        }
+      });
+
+      proc.on('close', (code) => {
+        // The backend prints a JSON result as the last stdout line.
+        // Check it even on exit code 0, since the Python CLI may
+        // catch errors and still exit cleanly.
+        let pullResult = null;
+        try { pullResult = JSON.parse(lastStdoutLine); } catch (_) {}
+
+        const succeeded = code === 0 && (!pullResult || pullResult.success !== false);
+
+        if (succeeded) {
+          sendDebugLog(`Successfully pulled model: ${modelName}`);
+
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('model-pull-complete', {
+              model: modelName,
+              success: true
+            });
+          }
+
+          resolve({ success: true, model: modelName });
+        } else {
+          const errorMsg = (pullResult && pullResult.error) || `Process exited with code ${code}`;
+          sendDebugLog(`Failed to pull model: ${modelName} - ${errorMsg}`);
+
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('model-pull-complete', {
+              model: modelName,
+              success: false,
+              error: errorMsg
+            });
+          }
+
+          resolve({ success: false, error: errorMsg });
+        }
+      });
+
+      proc.on('error', (error) => {
+        sendDebugLog(`Error pulling model: ${error.message}`);
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('model-pull-complete', {
+            model: modelName,
+            success: false,
+            error: error.message
+          });
+        }
+
+        resolve({ success: false, error: error.message });
+      });
+    });
+  } catch (error) {
+    sendDebugLog(`Error in pull-model handler: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
+// Helper to build env vars for running the bundled Ollama binary directly
+function getOllamaEnv() {
+  let ollamaDir;
+  if (app.isPackaged) {
+    ollamaDir = path.join(process.resourcesPath, 'stenoai', '_internal', 'ollama');
+  } else {
+    ollamaDir = path.join(__dirname, '..', 'bin');
+  }
+  const env = { ...process.env };
+  const existing = env.DYLD_LIBRARY_PATH || '';
+  env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;
+  env.MLX_METAL_PATH = path.join(ollamaDir, 'mlx.metallib');
+  return env;
+}
+
+// Helper function to find Ollama executable (bundled only)
+async function findOllamaExecutable() {
+  let bundledOllamaPath;
+  if (app.isPackaged) {
+    // Production: bundled inside PyInstaller _internal directory
+    bundledOllamaPath = path.join(process.resourcesPath, 'stenoai', '_internal', 'ollama', 'ollama');
+  } else {
+    // Development: in project bin/ directory
+    bundledOllamaPath = path.join(__dirname, '..', 'bin', 'ollama');
+  }
+
+  if (fs.existsSync(bundledOllamaPath)) {
+    console.log(`Using bundled Ollama: ${bundledOllamaPath}`);
+    return bundledOllamaPath;
+  }
+
+  console.error(`Bundled Ollama not found at: ${bundledOllamaPath}`);
+  return null;
+}
+
+// Update checking functionality
+async function checkForUpdates() {
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'api.github.com',
+      path: '/repos/ruzin/stenoai/releases/latest',
+      method: 'GET',
+      headers: {
+        'User-Agent': 'StenoAI-Updater'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        try {
+          const release = JSON.parse(data);
+          const latestVersion = release.tag_name.replace(/^v/, ''); // Remove 'v' prefix if present
+          
+          // Get current version from package.json
+          const packagePath = path.join(__dirname, 'package.json');
+          const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+          const currentVersion = packageContent.version;
+          
+          console.log(`Current version: ${currentVersion}, Latest version: ${latestVersion}`);
+          
+          // Simple version comparison (works for semantic versioning)
+          const isUpdateAvailable = compareVersions(currentVersion, latestVersion) < 0;
+          
+          resolve({
+            success: true,
+            updateAvailable: isUpdateAvailable,
+            currentVersion: currentVersion,
+            latestVersion: latestVersion,
+            releaseUrl: release.html_url,
+            releaseName: release.name || `Version ${latestVersion}`,
+            downloadUrl: getDownloadUrl(release.assets)
+          });
+        } catch (error) {
+          console.error('Error parsing GitHub API response:', error);
+          resolve({ success: false, error: 'Failed to parse update data' });
+        }
+      });
+    });
+    
+    req.on('error', (error) => {
+      console.error('Error checking for updates:', error);
+      resolve({ success: false, error: error.message });
+    });
+    
+    req.setTimeout(10000, () => {
+      req.destroy();
+      resolve({ success: false, error: 'Update check timeout' });
+    });
+    
+    req.end();
+  });
+}
+
+function compareVersions(current, latest) {
+  const currentParts = current.split('.').map(Number);
+  const latestParts = latest.split('.').map(Number);
+  
+  for (let i = 0; i < Math.max(currentParts.length, latestParts.length); i++) {
+    const currentPart = currentParts[i] || 0;
+    const latestPart = latestParts[i] || 0;
+    
+    if (currentPart < latestPart) return -1;
+    if (currentPart > latestPart) return 1;
+  }
+  
+  return 0;
+}
+
+function getDownloadUrl(assets) {
+  // Find the appropriate download URL based on platform/architecture
+  const platform = process.platform;
+  const arch = process.arch;
+  
+  if (platform === 'darwin') {
+    // Look for macOS DMG files
+    const armAsset = assets.find(asset => 
+      asset.name.includes('arm64') && asset.name.includes('dmg')
+    );
+    const intelAsset = assets.find(asset => 
+      asset.name.includes('x64') && asset.name.includes('dmg')
+    );
+    
+    // Prefer ARM64 for Apple Silicon, fallback to Intel
+    if (arch === 'arm64' && armAsset) return armAsset.browser_download_url;
+    if (intelAsset) return intelAsset.browser_download_url;
+    if (armAsset) return armAsset.browser_download_url;
+  }
+  
+  // Fallback to first asset or releases page
+  return assets.length > 0 ? assets[0].browser_download_url : null;
+}
+
+ipcMain.handle('check-for-updates', async () => {
+  return await checkForUpdates();
+});
+
+ipcMain.handle('check-announcements', async () => {
+  const packagePath = path.join(__dirname, 'package.json');
+  const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+  const currentVersion = packageContent.version;
+
+  // Try local file first (for development/testing)
+  const localPath = path.join(__dirname, '..', 'announcements.json');
+  if (fs.existsSync(localPath)) {
+    try {
+      const localData = JSON.parse(fs.readFileSync(localPath, 'utf8'));
+      console.log('Loaded announcements from local file');
+      return {
+        success: true,
+        announcements: localData.announcements || [],
+        currentVersion
+      };
+    } catch (error) {
+      console.error('Error reading local announcements.json:', error);
+    }
+  }
+
+  // Fall back to remote
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'raw.githubusercontent.com',
+      path: '/ruzin/stenoai/main/announcements.json',
+      method: 'GET',
+      headers: {
+        'User-Agent': 'StenoAI-App'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve({
+            success: true,
+            announcements: parsed.announcements || [],
+            currentVersion
+          });
+        } catch (error) {
+          console.error('Error parsing announcements:', error);
+          resolve({ success: false, error: 'Failed to parse announcements' });
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      console.error('Error fetching announcements:', error);
+      resolve({ success: false, error: error.message });
+    });
+
+    req.setTimeout(10000, () => {
+      req.destroy();
+      resolve({ success: false, error: 'Announcements fetch timeout' });
+    });
+
+    req.end();
+  });
+});
+
+ipcMain.handle('open-release-page', async (event, url) => {
+  try {
+    if (typeof url !== 'string' || !url) {
+      return { success: false, error: 'invalid url' };
+    }
+    let parsed;
+    try { parsed = new URL(url); } catch {
+      return { success: false, error: 'invalid url' };
+    }
+    // Release pages live on github.com -- restrict to that origin so a
+    // compromised renderer cannot launch arbitrary external URLs through
+    // this channel.
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') {
+      return { success: false, error: 'unsupported url' };
+    }
+    await shell.openExternal(url);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// Generic external-URL opener for renderer-triggered links (e.g. meeting
+// join URLs on Home). Http/https only — rejects custom schemes so a
+// compromised renderer cannot launch arbitrary protocol handlers.
+ipcMain.handle('open-external', async (event, url) => {
+  try {
+    if (typeof url !== 'string' || !url) {
+      return { success: false, error: 'invalid url' };
+    }
+    let parsed;
+    try { parsed = new URL(url); } catch {
+      return { success: false, error: 'invalid url' };
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { success: false, error: 'unsupported scheme' };
+    }
+    await shell.openExternal(url);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+// ── Google Calendar: Token Storage ──────────────────────────────────────
+
+function getTokenFilePath() {
+  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.google-tokens');
+}
+
+function saveGoogleTokens(tokens) {
+  try {
+    const tokenDir = path.dirname(getTokenFilePath());
+    if (!fs.existsSync(tokenDir)) {
+      fs.mkdirSync(tokenDir, { recursive: true });
+    }
+    const encrypted = safeStorage.encryptString(JSON.stringify(tokens));
+    fs.writeFileSync(getTokenFilePath(), encrypted);
+    console.log('Google tokens saved');
+  } catch (error) {
+    console.error('Failed to save Google tokens:', error.message);
+  }
+}
+
+function loadGoogleTokens() {
+  try {
+    const tokenPath = getTokenFilePath();
+    if (!fs.existsSync(tokenPath)) return null;
+    const encrypted = fs.readFileSync(tokenPath);
+    const decrypted = safeStorage.decryptString(encrypted);
+    return JSON.parse(decrypted);
+  } catch (error) {
+    console.error('Failed to load Google tokens:', error.message);
+    return null;
+  }
+}
+
+function deleteGoogleTokens() {
+  try {
+    const tokenPath = getTokenFilePath();
+    if (fs.existsSync(tokenPath)) {
+      fs.unlinkSync(tokenPath);
+      console.log('Google tokens deleted');
+    }
+  } catch (error) {
+    console.error('Failed to delete Google tokens:', error.message);
+  }
+}
+
+// ── Outlook Calendar: Token Storage ─────────────────────────────────────
+
+function getOutlookTokenFilePath() {
+  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.outlook-tokens');
+}
+
+function saveOutlookTokens(tokens) {
+  try {
+    const tokenDir = path.dirname(getOutlookTokenFilePath());
+    if (!fs.existsSync(tokenDir)) {
+      fs.mkdirSync(tokenDir, { recursive: true });
+    }
+    const encrypted = safeStorage.encryptString(JSON.stringify(tokens));
+    fs.writeFileSync(getOutlookTokenFilePath(), encrypted);
+    console.log('Outlook tokens saved');
+  } catch (error) {
+    console.error('Failed to save Outlook tokens:', error.message);
+  }
+}
+
+function loadOutlookTokens() {
+  try {
+    const tokenPath = getOutlookTokenFilePath();
+    if (!fs.existsSync(tokenPath)) return null;
+    const encrypted = fs.readFileSync(tokenPath);
+    const decrypted = safeStorage.decryptString(encrypted);
+    return JSON.parse(decrypted);
+  } catch (error) {
+    console.error('Failed to load Outlook tokens:', error.message);
+    return null;
+  }
+}
+
+function deleteOutlookTokens() {
+  try {
+    const tokenPath = getOutlookTokenFilePath();
+    if (fs.existsSync(tokenPath)) {
+      fs.unlinkSync(tokenPath);
+      console.log('Outlook tokens deleted');
+    }
+  } catch (error) {
+    console.error('Failed to delete Outlook tokens:', error.message);
+  }
+}
+
+// ── Google Calendar: OAuth2 Flow with PKCE ──────────────────────────────
+
+function startGoogleAuth() {
+  return new Promise((resolve, reject) => {
+    // Generate PKCE code verifier and challenge
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('hex');
+    let timeoutId = null;
+
+    // Start temporary HTTP server on loopback for OAuth redirect
+    const server = http.createServer(async (req, res) => {
+      try {
+        const reqUrl = new URL(req.url, `http://127.0.0.1`);
+        if (!reqUrl.pathname.startsWith('/callback')) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+
+        const code = reqUrl.searchParams.get('code');
+        const error = reqUrl.searchParams.get('error');
+        const returnedState = reqUrl.searchParams.get('state');
+
+        if (returnedState !== state) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Invalid state parameter</h2><p>Possible CSRF attack. Please try again.</p></body></html>');
+          return;
+        }
+
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Authorization denied</h2><p>You can close this tab.</p></body></html>');
+          server.close();
+          if (timeoutId) clearTimeout(timeoutId);
+          reject(new Error(`Auth denied: ${error}`));
+          return;
+        }
+
+        if (!code) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Missing authorization code</h2></body></html>');
+          return;
+        }
+
+        // Exchange code for tokens
+        const port = server.address().port;
+        const tokens = await exchangeCodeForTokens(code, codeVerifier, port);
+        saveGoogleTokens(tokens);
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<html><body style="font-family: -apple-system, sans-serif; text-align: center; padding: 60px;"><h2>Connected to Google Calendar</h2><p>You can close this tab and return to StenoAI.</p></body></html>');
+
+        server.close();
+        if (timeoutId) clearTimeout(timeoutId);
+
+        // Notify renderer and bring app to foreground
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('google-auth-changed');
+          mainWindow.show();
+          mainWindow.focus();
+        }
+
+        resolve({ success: true });
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'text/html' });
+        res.end('<html><body><h2>Authentication failed</h2><p>Please try again.</p></body></html>');
+        server.close();
+        if (timeoutId) clearTimeout(timeoutId);
+        reject(err);
+      }
+    });
+
+    // Listen on loopback only (security: not 0.0.0.0)
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+      const authParams = new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: GOOGLE_SCOPES,
+        access_type: 'offline',
+        prompt: 'consent',
+        state: state,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256'
+      });
+
+      const authUrl = `${GOOGLE_AUTH_URL}?${authParams.toString()}`;
+      shell.openExternal(authUrl);
+    });
+
+    timeoutId = setTimeout(() => {
+      if (server.listening) {
+        server.close();
+        reject(new Error('OAuth timeout: no response within 5 minutes'));
+      }
+    }, 5 * 60 * 1000);
+  });
+}
+
+function exchangeCodeForTokens(code, codeVerifier, port) {
+  return new Promise((resolve, reject) => {
+    const redirectUri = `http://127.0.0.1:${port}/callback`;
+    const postData = new URLSearchParams({
+      code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      code_verifier: codeVerifier
+    }).toString();
+
+    const options = {
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Token exchange failed: ${parsed.error_description || parsed.error}`));
+            return;
+          }
+          // Store expiry as absolute timestamp
+          parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('Failed to parse token response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Google Calendar: Token Refresh ──────────────────────────────────────
+
+async function getValidAccessToken() {
+  const tokens = loadGoogleTokens();
+  if (!tokens) return null;
+
+  // Check if token is expired or about to expire (5-min buffer)
+  const bufferMs = 5 * 60 * 1000;
+  if (tokens.expires_at && Date.now() < tokens.expires_at - bufferMs) {
+    return tokens.access_token;
+  }
+
+  // Token expired, try to refresh
+  if (!tokens.refresh_token) {
+    deleteGoogleTokens();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('google-auth-changed');
+    }
+    return null;
+  }
+
+  try {
+    const newTokens = await refreshAccessToken(tokens.refresh_token);
+    // Preserve the refresh token (Google may not return it again)
+    newTokens.refresh_token = newTokens.refresh_token || tokens.refresh_token;
+    newTokens.expires_at = Date.now() + (newTokens.expires_in * 1000);
+    saveGoogleTokens(newTokens);
+    return newTokens.access_token;
+  } catch (error) {
+    console.error('Token refresh failed:', error.message);
+    if (error.message && (error.message.includes('invalid_grant') || error.message.includes('Token has been expired or revoked'))) {
+      deleteGoogleTokens();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('google-auth-changed');
+      }
+    }
+    return null;
+  }
+}
+
+function refreshAccessToken(refreshToken) {
+  return new Promise((resolve, reject) => {
+    const postData = new URLSearchParams({
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token'
+    }).toString();
+
+    const options = {
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Refresh failed: ${parsed.error_description || parsed.error}`));
+            return;
+          }
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('Failed to parse refresh response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Google Calendar: Fetch Events ───────────────────────────────────────
+
+function fetchCalendarEvents(accessToken, maxResults = 7) {
+  return new Promise((resolve, reject) => {
+    const now = new Date();
+    const weekAhead = new Date(now);
+    weekAhead.setDate(weekAhead.getDate() + 7);
+    const params = new URLSearchParams({
+      timeMin: now.toISOString(),
+      timeMax: weekAhead.toISOString(),
+      maxResults: String(maxResults),
+      singleEvents: 'true',
+      orderBy: 'startTime',
+      fields: 'items(id,summary,description,start,end,attendees,htmlLink,conferenceData)'
+    });
+
+    const options = {
+      hostname: 'www.googleapis.com',
+      path: `/calendar/v3/calendars/primary/events?${params.toString()}`,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Calendar API error: ${parsed.error.message || parsed.error}`));
+            return;
+          }
+          resolve(parsed.items || []);
+        } catch (err) {
+          reject(new Error('Failed to parse calendar response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── Outlook Calendar: OAuth2 Flow with PKCE ─────────────────────────────
+
+function startOutlookAuth() {
+  return new Promise((resolve, reject) => {
+    const codeVerifier = crypto.randomBytes(32).toString('base64url');
+    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+    const state = crypto.randomBytes(16).toString('hex');
+    let timeoutId = null;
+
+    const server = http.createServer(async (req, res) => {
+      try {
+        const reqUrl = new URL(req.url, `http://localhost`);
+        // Ignore favicon and other noise — only handle the root path
+        if (reqUrl.pathname !== '/') {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+
+        const code = reqUrl.searchParams.get('code');
+        const error = reqUrl.searchParams.get('error');
+        const returnedState = reqUrl.searchParams.get('state');
+
+        if (returnedState !== state) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Invalid state parameter</h2><p>Possible CSRF attack. Please try again.</p></body></html>');
+          return;
+        }
+
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Authorization denied</h2><p>You can close this tab.</p></body></html>');
+          server.close();
+          if (timeoutId) clearTimeout(timeoutId);
+          reject(new Error(`Auth denied: ${error}`));
+          return;
+        }
+
+        if (!code) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Missing authorization code</h2></body></html>');
+          return;
+        }
+
+        const port = server.address().port;
+        const tokens = await exchangeOutlookCodeForTokens(code, codeVerifier, port);
+        saveOutlookTokens(tokens);
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<html><body style="font-family: -apple-system, sans-serif; text-align: center; padding: 60px;"><h2>Connected to Outlook Calendar</h2><p>You can close this tab and return to StenoAI.</p></body></html>');
+
+        server.close();
+        if (timeoutId) clearTimeout(timeoutId);
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('outlook-auth-changed');
+          mainWindow.show();
+          mainWindow.focus();
+        }
+
+        resolve({ success: true });
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'text/html' });
+        res.end('<html><body><h2>Authentication failed</h2><p>Please try again.</p></body></html>');
+        server.close();
+        if (timeoutId) clearTimeout(timeoutId);
+        reject(err);
+      }
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      const redirectUri = `http://localhost:${port}`;
+
+      const authParams = new URLSearchParams({
+        client_id: OUTLOOK_CLIENT_ID,
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        scope: OUTLOOK_SCOPES,
+        response_mode: 'query',
+        state: state,
+        code_challenge: codeChallenge,
+        code_challenge_method: 'S256'
+      });
+
+      const authUrl = `${OUTLOOK_AUTH_URL}?${authParams.toString()}`;
+      shell.openExternal(authUrl);
+    });
+
+    timeoutId = setTimeout(() => {
+      if (server.listening) {
+        server.close();
+        reject(new Error('OAuth timeout: no response within 5 minutes'));
+      }
+    }, 5 * 60 * 1000);
+  });
+}
+
+function exchangeOutlookCodeForTokens(code, codeVerifier, port) {
+  return new Promise((resolve, reject) => {
+    const redirectUri = `http://localhost:${port}`;
+    const postData = new URLSearchParams({
+      code,
+      client_id: OUTLOOK_CLIENT_ID,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      code_verifier: codeVerifier
+    }).toString();
+
+    const tokenUrl = new URL(OUTLOOK_TOKEN_URL);
+    const options = {
+      hostname: tokenUrl.hostname,
+      path: tokenUrl.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Token exchange failed: ${parsed.error_description || parsed.error}`));
+            return;
+          }
+          parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('Failed to parse token response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Outlook Calendar: Token Refresh ─────────────────────────────────────
+
+async function getValidOutlookAccessToken() {
+  const tokens = loadOutlookTokens();
+  if (!tokens) return null;
+
+  const bufferMs = 5 * 60 * 1000;
+  if (tokens.expires_at && Date.now() < tokens.expires_at - bufferMs) {
+    return tokens.access_token;
+  }
+
+  if (!tokens.refresh_token) {
+    deleteOutlookTokens();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('outlook-auth-changed');
+    }
+    return null;
+  }
+
+  try {
+    const newTokens = await refreshOutlookAccessToken(tokens.refresh_token);
+    newTokens.refresh_token = newTokens.refresh_token || tokens.refresh_token;
+    newTokens.expires_at = Date.now() + (newTokens.expires_in * 1000);
+    saveOutlookTokens(newTokens);
+    return newTokens.access_token;
+  } catch (error) {
+    console.error('Outlook token refresh failed:', error.message);
+    // Only delete tokens for irrecoverable errors (revoked/expired grant)
+    // Transient network errors should not force re-authentication
+    if (error.message && (error.message.includes('invalid_grant') || error.message.includes('interaction_required'))) {
+      deleteOutlookTokens();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('outlook-auth-changed');
+      }
+    }
+    return null;
+  }
+}
+
+function refreshOutlookAccessToken(refreshToken) {
+  return new Promise((resolve, reject) => {
+    const postData = new URLSearchParams({
+      client_id: OUTLOOK_CLIENT_ID,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+      scope: OUTLOOK_SCOPES
+    }).toString();
+
+    const tokenUrl = new URL(OUTLOOK_TOKEN_URL);
+    const options = {
+      hostname: tokenUrl.hostname,
+      path: tokenUrl.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Refresh failed: ${parsed.error_description || parsed.error}`));
+            return;
+          }
+          resolve(parsed);
+        } catch (err) {
+          reject(new Error('Failed to parse refresh response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// ── Outlook Calendar: Fetch Events ──────────────────────────────────────
+
+function fetchOutlookCalendarEvents(accessToken, maxResults = 7) {
+  return new Promise((resolve, reject) => {
+    const now = new Date();
+    const weekAhead = new Date(now);
+    weekAhead.setDate(weekAhead.getDate() + 7);
+
+    const params = new URLSearchParams({
+      startDateTime: now.toISOString(),
+      endDateTime: weekAhead.toISOString(),
+      $top: String(maxResults),
+      $orderby: 'start/dateTime',
+      $select: 'id,subject,body,start,end,attendees,webLink,onlineMeeting,isOnlineMeeting'
+    });
+
+    const options = {
+      hostname: 'graph.microsoft.com',
+      path: `/v1.0/me/calendarView?${params.toString()}`,
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Prefer': 'outlook.timezone="UTC"'
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Outlook Calendar API error: ${parsed.error.message || parsed.error}`));
+            return;
+          }
+          const events = (parsed.value || []).map(normalizeOutlookEvent);
+          resolve(events);
+        } catch (err) {
+          reject(new Error('Failed to parse Outlook calendar response'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function normalizeOutlookEvent(event) {
+  // Map Microsoft Graph event shape to Google Calendar shape for renderer compatibility
+  const stripHtml = (html) => {
+    if (!html) return '';
+    return html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(?:div|p|tr|li|h[1-6])>/gi, '\n')
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/\r\n/g, '\n')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/(\s*\n){3,}/g, '\n\n')
+      .trim();
+  };
+
+  const ensureUtcSuffix = (dt) => {
+    if (!dt) return undefined;
+    return dt.endsWith('Z') ? dt : dt + 'Z';
+  };
+
+  return {
+    id: event.id,
+    summary: event.subject || 'No title',
+    description: stripHtml(event.body?.content),
+    start: {
+      dateTime: ensureUtcSuffix(event.start?.dateTime),
+      timeZone: 'UTC'
+    },
+    end: {
+      dateTime: ensureUtcSuffix(event.end?.dateTime),
+      timeZone: 'UTC'
+    },
+    attendees: (event.attendees || []).map(a => ({
+      email: a.emailAddress?.address || '',
+      displayName: a.emailAddress?.name || '',
+      responseStatus: a.status?.response || ''
+    })),
+    htmlLink: event.webLink,
+    conferenceData: event.isOnlineMeeting && event.onlineMeeting ? {
+      entryPoints: [{ uri: event.onlineMeeting.joinUrl, entryPointType: 'video' }]
+    } : undefined
+  };
+}
+
+// ── Google Calendar: IPC Handlers ───────────────────────────────────────
+
+ipcMain.handle('google-auth-start', async () => {
+  try {
+    await startGoogleAuth();
+    // Only disconnect Outlook after Google auth succeeds
+    deleteOutlookTokens();
+    return { success: true };
+  } catch (error) {
+    console.error('Google auth failed:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('google-auth-status', async () => {
+  try {
+    const tokens = loadGoogleTokens();
+    return { success: true, connected: !!tokens };
+  } catch (error) {
+    return { success: false, connected: false };
+  }
+});
+
+ipcMain.handle('google-auth-disconnect', async () => {
+  try {
+    // Best-effort token revocation
+    const tokens = loadGoogleTokens();
+    if (tokens && tokens.access_token) {
+      try {
+        await new Promise((resolve) => {
+          const revokeParams = new URLSearchParams({ token: tokens.access_token });
+          const req = https.request({
+            hostname: 'oauth2.googleapis.com',
+            path: `/revoke?${revokeParams.toString()}`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+          }, () => resolve());
+          req.on('error', () => resolve()); // Best-effort
+          req.end();
+        });
+      } catch (e) {
+        // Best-effort revocation -- ignore errors
+      }
+    }
+
+    deleteGoogleTokens();
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('google-auth-changed');
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+function normalizeCalendarEvent(event) {
+  const start =
+    event.start?.dateTime ||
+    event.start?.date ||
+    (typeof event.start === 'string' ? event.start : '');
+  const end =
+    event.end?.dateTime ||
+    event.end?.date ||
+    (typeof event.end === 'string' ? event.end : '');
+  return {
+    id: event.id,
+    title: event.summary || event.title || 'No title',
+    start,
+    end,
+    meeting_url:
+      event.hangoutLink ||
+      event.onlineMeeting?.joinUrl ||
+      event.meeting_url ||
+      undefined,
+  };
+}
+
+ipcMain.handle('get-calendar-events', async () => {
+  try {
+    // Check which provider is connected (only one at a time)
+    const googleToken = await getValidAccessToken();
+    if (googleToken) {
+      const raw = await fetchCalendarEvents(googleToken);
+      return { success: true, events: raw.map(normalizeCalendarEvent) };
+    }
+
+    const outlookToken = await getValidOutlookAccessToken();
+    if (outlookToken) {
+      const raw = await fetchOutlookCalendarEvents(outlookToken);
+      return { success: true, events: raw.map(normalizeCalendarEvent) };
+    }
+
+    return { success: false, needsAuth: true };
+  } catch (error) {
+    console.error('Failed to fetch calendar events:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+// ── Outlook Calendar: IPC Handlers ──────────────────────────────────────
+
+ipcMain.handle('outlook-auth-start', async () => {
+  try {
+    await startOutlookAuth();
+    // Only disconnect Google after Outlook auth succeeds
+    deleteGoogleTokens();
+    return { success: true };
+  } catch (error) {
+    console.error('Outlook auth failed:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('outlook-auth-status', async () => {
+  try {
+    const tokens = loadOutlookTokens();
+    return { success: true, connected: !!tokens };
+  } catch (error) {
+    return { success: false, connected: false };
+  }
+});
+
+ipcMain.handle('outlook-auth-disconnect', async () => {
+  try {
+    deleteOutlookTokens();
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('outlook-auth-changed');
+    }
+
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});

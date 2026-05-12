@@ -1,0 +1,597 @@
+"""
+Configuration management for StenoAI.
+
+Handles storing and loading user preferences like model selection.
+"""
+
+import json
+import logging
+import uuid
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+
+class Config:
+    """Manages application configuration with file persistence."""
+
+    DEFAULT_MODEL = "llama3.2:3b"
+
+    # Supported models with metadata (organized by parameter size, ascending)
+    SUPPORTED_MODELS = {
+        "llama3.2:3b": {
+            "name": "Llama 3.2 3B",
+            "size": "2GB",
+            "params": "3B",
+            "description": "Fast and lightweight for quick meetings (default)",
+            "speed": "very fast",
+            "quality": "good"
+        },
+        "gemma3:4b": {
+            "name": "Gemma 3 4B",
+            "size": "2.5GB",
+            "params": "4B",
+            "description": "Lightweight and efficient",
+            "speed": "fast",
+            "quality": "good"
+        },
+        "qwen3.5:9b": {
+            "name": "Qwen 3.5 9B",
+            "size": "6.6GB",
+            "params": "9B",
+            "description": "Excellent at structured output and action items",
+            "speed": "medium",
+            "quality": "excellent"
+        },
+        "deepseek-r1:14b": {
+            "name": "DeepSeek R1 14B",
+            "size": "9.0GB",
+            "params": "14B",
+            "description": "Strong reasoning and analysis capabilities",
+            "speed": "fast",
+            "quality": "excellent"
+        },
+        "gpt-oss:20b": {
+            "name": "GPT-OSS 20B",
+            "size": "14GB",
+            "params": "20B",
+            "description": "OpenAI open-weight model with reasoning capabilities",
+            "speed": "medium",
+            "quality": "excellent"
+        },
+        "qwen3:8b": {
+            "name": "Qwen 3 8B",
+            "size": "4.7GB",
+            "params": "8B",
+            "description": "Replaced by Qwen 3.5 9B",
+            "speed": "fast",
+            "quality": "excellent",
+            "deprecated": True
+        },
+        "deepseek-r1:8b": {
+            "name": "DeepSeek R1 8B",
+            "size": "4.7GB",
+            "params": "8B",
+            "description": "Replaced by DeepSeek R1 14B",
+            "speed": "medium",
+            "quality": "excellent",
+            "deprecated": True
+        }
+    }
+
+
+    SUPPORTED_WHISPER_MODELS = ["tiny", "base", "small", "medium", "large", "large-v3-turbo"]
+
+    # Languages shown in the settings dropdown (curated/tested)
+    SUPPORTED_LANGUAGES = {
+        "auto": "Auto (detect)",
+        "en": "English",
+        "es": "Spanish",
+        "fr": "French",
+        "de": "German",
+        "nl": "Dutch",
+        "pt": "Portuguese",
+        "ja": "Japanese",
+        "zh": "Chinese",
+        "ko": "Korean",
+        "hi": "Hindi",
+        "ar": "Arabic",
+    }
+
+    # Full ISO 639-1 language names for auto-detect passthrough.
+    # Whisper supports 99 languages; this maps codes to display names
+    # so the summarizer prompt gets a proper language name (e.g. "Polish")
+    # rather than just a code (e.g. "pl").
+    _LANGUAGE_NAMES = {
+        "af": "Afrikaans", "am": "Amharic", "ar": "Arabic", "as": "Assamese",
+        "az": "Azerbaijani", "ba": "Bashkir", "be": "Belarusian", "bg": "Bulgarian",
+        "bn": "Bengali", "bo": "Tibetan", "br": "Breton", "bs": "Bosnian",
+        "ca": "Catalan", "cs": "Czech", "cy": "Welsh", "da": "Danish",
+        "de": "German", "el": "Greek", "en": "English", "es": "Spanish",
+        "et": "Estonian", "eu": "Basque", "fa": "Persian", "fi": "Finnish",
+        "fo": "Faroese", "fr": "French", "gl": "Galician", "gu": "Gujarati",
+        "ha": "Hausa", "haw": "Hawaiian", "he": "Hebrew", "hi": "Hindi",
+        "hr": "Croatian", "ht": "Haitian Creole", "hu": "Hungarian", "hy": "Armenian",
+        "id": "Indonesian", "is": "Icelandic", "it": "Italian", "ja": "Japanese",
+        "jw": "Javanese", "ka": "Georgian", "kk": "Kazakh", "km": "Khmer",
+        "kn": "Kannada", "ko": "Korean", "la": "Latin", "lb": "Luxembourgish",
+        "ln": "Lingala", "lo": "Lao", "lt": "Lithuanian", "lv": "Latvian",
+        "mg": "Malagasy", "mi": "Maori", "mk": "Macedonian", "ml": "Malayalam",
+        "mn": "Mongolian", "mr": "Marathi", "ms": "Malay", "mt": "Maltese",
+        "my": "Myanmar", "ne": "Nepali", "nl": "Dutch", "nn": "Nynorsk",
+        "no": "Norwegian", "oc": "Occitan", "pa": "Punjabi", "pl": "Polish",
+        "ps": "Pashto", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian",
+        "sa": "Sanskrit", "sd": "Sindhi", "si": "Sinhala", "sk": "Slovak",
+        "sl": "Slovenian", "sn": "Shona", "so": "Somali", "sq": "Albanian",
+        "sr": "Serbian", "su": "Sundanese", "sv": "Swedish", "sw": "Swahili",
+        "ta": "Tamil", "te": "Telugu", "tg": "Tajik", "th": "Thai",
+        "tk": "Turkmen", "tl": "Tagalog", "tr": "Turkish", "tt": "Tatar",
+        "uk": "Ukrainian", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese",
+        "yi": "Yiddish", "yo": "Yoruba", "zh": "Chinese",
+    }
+
+    def __init__(self, config_path: Optional[Path] = None):
+        """
+        Initialize configuration manager.
+
+        Args:
+            config_path: Path to config file. If None, uses default location.
+        """
+        if config_path is None:
+            import sys as _sys
+            if getattr(_sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
+                # Bundled (PyInstaller dev or production): ~/Library/Application Support/stenoai
+                base_dir = Path.home() / "Library" / "Application Support" / "stenoai"
+            else:
+                # Source dev: project root
+                base_dir = Path(__file__).parent.parent
+
+            base_dir.mkdir(parents=True, exist_ok=True)
+            self.config_path = base_dir / "config.json"
+        else:
+            self.config_path = config_path
+
+        self._config: Dict[str, Any] = self._load()
+        self._migrate_cloud_model_map()
+
+    def _migrate_cloud_model_map(self) -> None:
+        """One-shot migration from legacy single 'cloud_model' to per-provider
+        'cloud_models' map. Runs at load time (before any setters can change
+        the provider) so the legacy value is correctly attributed to whichever
+        provider was active when it was last saved."""
+        if isinstance(self._config.get("cloud_models"), dict):
+            return  # Already migrated.
+        legacy = self._config.get("cloud_model")
+        has_legacy_value = isinstance(legacy, str) and legacy.strip()
+        if not has_legacy_value:
+            # Nothing to migrate. Don't write — if _load() returned defaults
+            # because the existing file was corrupt/unreadable, persisting an
+            # empty cloud_models map would overwrite the recoverable file.
+            self._config["cloud_models"] = {}
+            return
+        current_provider = self._config.get("cloud_provider", "openai")
+        if current_provider not in self.VALID_CLOUD_PROVIDERS:
+            current_provider = "openai"
+        self._config["cloud_models"] = {current_provider: legacy.strip()}
+        self._save()
+
+    def _load(self) -> Dict[str, Any]:
+        """Load configuration from file."""
+        if not self.config_path.exists():
+            logger.info(f"Config file not found, creating default at {self.config_path}")
+            return self._get_default_config()
+
+        try:
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+                logger.info(f"Loaded config from {self.config_path}")
+                return config
+        except Exception as e:
+            logger.error(f"Error loading config: {e}, using defaults")
+            return self._get_default_config()
+
+    def _save(self) -> bool:
+        """Save configuration to file."""
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(self._config, f, indent=2)
+            logger.info(f"Saved config to {self.config_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving config: {e}")
+            return False
+
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration."""
+        return {
+            "model": self.DEFAULT_MODEL,
+            "notifications_enabled": True,
+            "telemetry_enabled": True,
+            # Default ON — CoreAudio Process Tap captures system audio
+            # alongside the mic on macOS 14.4+. Older macOS auto-falls back
+            # to mic-only via main.js's loadSystemAudioEnabled() OS gate.
+            "system_audio_enabled": True,
+            "language": "en",
+            "ai_provider": "local",
+            "remote_ollama_url": "",
+            "cloud_api_url": "",
+            "cloud_provider": "openai",
+            "cloud_model": "gpt-4o-mini",
+            "anonymous_id": str(uuid.uuid4()),
+            "storage_path": "",
+            "keep_recordings": False,
+            "whisper_model": "small",
+            "version": "1.0"
+        }
+
+    def get_storage_path(self) -> str:
+        """Get the custom storage path. Empty string means use default."""
+        return self._config.get("storage_path", "")
+
+    def set_storage_path(self, storage_path: str) -> bool:
+        """
+        Set custom storage path for recordings/transcripts/output.
+
+        Args:
+            storage_path: Absolute path to storage directory, or empty string to reset to default.
+
+        Returns:
+            True if saved successfully, False otherwise.
+        """
+        if storage_path is None:
+            storage_path = ""
+        storage_path = storage_path.strip()
+
+        if storage_path:
+            sp = Path(storage_path)
+            if not sp.is_absolute():
+                logger.error(f"Storage path must be absolute: {storage_path}")
+                return False
+            # Create subdirectories at the new location. If this fails
+            # (for example due to permissions), keep existing config unchanged.
+            try:
+                for subdir in ("recordings", "transcripts", "output"):
+                    (sp / subdir).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error(f"Failed to initialize storage path {storage_path}: {e}")
+                return False
+
+        self._config["storage_path"] = storage_path
+        return self._save()
+
+    def get_model(self) -> str:
+        """Get the configured model name."""
+        return self._config.get("model", self.DEFAULT_MODEL)
+
+    def set_model(self, model_name: str) -> bool:
+        """
+        Set the model to use for summarization.
+
+        Args:
+            model_name: Name of the model (e.g., "llama3.1:8b")
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        # Validate model name
+        if model_name not in self.SUPPORTED_MODELS:
+            logger.warning(f"Model {model_name} not in supported list, but allowing anyway")
+
+        self._config["model"] = model_name
+        return self._save()
+
+    def get_model_info(self, model_name: str) -> Optional[Dict[str, str]]:
+        """
+        Get metadata about a specific model.
+
+        Args:
+            model_name: Name of the model
+
+        Returns:
+            Dictionary with model metadata or None if not found
+        """
+        return self.SUPPORTED_MODELS.get(model_name)
+
+    def list_supported_models(self) -> Dict[str, Dict[str, str]]:
+        """Get all supported models with their metadata."""
+        return self.SUPPORTED_MODELS.copy()
+
+    def get_notifications_enabled(self) -> bool:
+        """Get whether desktop notifications are enabled."""
+        return self._config.get("notifications_enabled", True)
+
+    def set_notifications_enabled(self, enabled: bool) -> bool:
+        """
+        Set whether desktop notifications are enabled.
+
+        Args:
+            enabled: True to enable notifications, False to disable
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        self._config["notifications_enabled"] = enabled
+        return self._save()
+
+    def get_telemetry_enabled(self) -> bool:
+        """Get whether anonymous usage analytics are enabled."""
+        return self._config.get("telemetry_enabled", True)
+
+    def set_telemetry_enabled(self, enabled: bool) -> bool:
+        """
+        Set whether anonymous usage analytics are enabled.
+
+        Args:
+            enabled: True to enable telemetry, False to disable
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        self._config["telemetry_enabled"] = enabled
+        return self._save()
+
+    def get_hide_dock_icon(self) -> bool:
+        """Get whether the dock icon should be hidden (menu bar only mode)."""
+        return self._config.get("hide_dock_icon", False)
+
+    def set_hide_dock_icon(self, enabled: bool) -> bool:
+        """
+        Set whether the dock icon should be hidden.
+
+        Args:
+            enabled: True to hide dock icon (menu bar only), False to show
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        self._config["hide_dock_icon"] = enabled
+        return self._save()
+
+
+    def get_keep_recordings(self) -> bool:
+        """Get whether audio recordings should be kept after processing."""
+        return self._config.get("keep_recordings", False)
+
+    def set_keep_recordings(self, enabled: bool) -> bool:
+        """Set whether audio recordings should be kept after processing."""
+        self._config["keep_recordings"] = enabled
+        return self._save()
+
+
+    def get_whisper_model(self) -> str:
+        """Get the configured Whisper model size."""
+        model = self._config.get("whisper_model", "small")
+        if model not in self.SUPPORTED_WHISPER_MODELS:
+            logger.warning(f"Invalid Whisper model in config: {model}; falling back to small")
+            return "small"
+        return model
+
+    def set_whisper_model(self, model_size: str) -> bool:
+        """Set the Whisper model size."""
+        if model_size not in self.SUPPORTED_WHISPER_MODELS:
+            logger.error(f"Unsupported Whisper model: {model_size}")
+            return False
+        self._config["whisper_model"] = model_size
+        return self._save()
+
+    def get_system_audio_enabled(self) -> bool:
+        """Get whether system audio capture is enabled."""
+        return self._config.get("system_audio_enabled", True)
+
+    def set_system_audio_enabled(self, enabled: bool) -> bool:
+        """
+        Set whether system audio capture is enabled.
+
+        Args:
+            enabled: True to enable system audio capture, False to disable
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        self._config["system_audio_enabled"] = enabled
+        return self._save()
+
+    def get_language(self) -> str:
+        """Get the configured language code for transcription and summarization."""
+        return self._config.get("language", "en")
+
+    def set_language(self, language_code: str) -> bool:
+        """
+        Set the language for transcription and summarization.
+
+        Args:
+            language_code: Language code (e.g., "en", "de", "auto")
+
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        if language_code not in self.SUPPORTED_LANGUAGES:
+            logger.error(f"Unsupported language code: {language_code}")
+            return False
+
+        self._config["language"] = language_code
+        return self._save()
+
+    def get_language_name(self, language_code: Optional[str] = None) -> str:
+        """Get the display name for a language code."""
+        if language_code is None:
+            language_code = self.get_language()
+        return (
+            self.SUPPORTED_LANGUAGES.get(language_code)
+            or self._LANGUAGE_NAMES.get(language_code)
+            or (language_code.upper() if language_code else "Unknown")
+        )
+
+    # --- AI provider settings ---
+
+    VALID_AI_PROVIDERS = ("local", "remote", "cloud")
+    VALID_CLOUD_PROVIDERS = ("openai", "anthropic", "custom")
+
+    def get_ai_provider(self) -> str:
+        """Get the configured AI provider ('local', 'remote', or 'cloud')."""
+        value = self._config.get("ai_provider", "local")
+        return value if value in self.VALID_AI_PROVIDERS else "local"
+
+    def set_ai_provider(self, provider: str) -> bool:
+        """Set the AI provider mode."""
+        if provider not in self.VALID_AI_PROVIDERS:
+            logger.error(f"Invalid AI provider: {provider}. Must be one of {self.VALID_AI_PROVIDERS}")
+            return False
+        self._config["ai_provider"] = provider
+        return self._save()
+
+    def get_remote_ollama_url(self) -> str:
+        """Get the remote Ollama server URL."""
+        return self._config.get("remote_ollama_url", "")
+
+    def set_remote_ollama_url(self, url: str) -> bool:
+        """Set the remote Ollama server URL."""
+        self._config["remote_ollama_url"] = url.strip()
+        return self._save()
+
+    def get_cloud_api_url(self) -> str:
+        """Get the cloud API URL."""
+        return self._config.get("cloud_api_url", "")
+
+    def set_cloud_api_url(self, url: str) -> bool:
+        """Set the cloud API URL."""
+        self._config["cloud_api_url"] = url.strip()
+        return self._save()
+
+    def get_cloud_api_key(self) -> str:
+        """Get the cloud API key from env var (set by Electron via safeStorage)."""
+        import os
+        return os.environ.get("STENOAI_CLOUD_API_KEY", "")
+
+    # Per-provider sensible defaults. Used when the user switches provider for
+    # the first time and we have no remembered model for that provider yet.
+    CLOUD_MODEL_DEFAULTS = {
+        "openai": "gpt-4o-mini",
+        "anthropic": "claude-haiku-4-5-20251001",
+        "custom": "gpt-4o-mini",
+    }
+
+    def get_cloud_provider(self) -> str:
+        """Get the cloud provider type ('openai', 'anthropic', or 'custom')."""
+        value = self._config.get("cloud_provider", "openai")
+        return value if value in self.VALID_CLOUD_PROVIDERS else "openai"
+
+    def set_cloud_provider(self, provider: str) -> bool:
+        """Set the cloud provider type."""
+        if provider not in self.VALID_CLOUD_PROVIDERS:
+            logger.error(f"Invalid cloud provider: {provider}. Must be one of {self.VALID_CLOUD_PROVIDERS}")
+            return False
+        self._config["cloud_provider"] = provider
+        return self._save()
+
+    def _get_cloud_models_map(self) -> dict:
+        """Per-provider model store. Migration is handled in __init__ so this
+        just returns the dict (or empty)."""
+        models = self._config.get("cloud_models")
+        if not isinstance(models, dict):
+            models = {}
+            self._config["cloud_models"] = models
+        return models
+
+    def get_cloud_model(self) -> str:
+        """Get the cloud model for the currently selected provider. Each
+        provider has its own remembered model so switching providers doesn't
+        carry an incompatible model name across (e.g. a Claude model into
+        OpenAI). Falls back to the per-provider default on first use."""
+        provider = self.get_cloud_provider()
+        models = self._get_cloud_models_map()
+        if provider in models and isinstance(models[provider], str) and models[provider].strip():
+            return models[provider]
+        return self.CLOUD_MODEL_DEFAULTS.get(provider, "gpt-4o-mini")
+
+    def set_cloud_model(self, model: str) -> bool:
+        """Set the cloud model for the currently selected provider."""
+        provider = self.get_cloud_provider()
+        models = self._get_cloud_models_map()
+        models[provider] = model.strip()
+        self._config["cloud_models"] = models
+        # Mirror to legacy 'cloud_model' so any code still reading the flat
+        # field sees the active provider's choice. Safe to remove once no
+        # consumers reference it.
+        self._config["cloud_model"] = model.strip()
+        return self._save()
+
+    def get_user_name(self) -> str:
+        """Get the user's first name (for greetings). Empty string when unset."""
+        value = self._config.get("user_name")
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def set_user_name(self, name: str) -> bool:
+        """Persist the user's first name. Trims whitespace; an empty name
+        clears the field."""
+        cleaned = (name or "").strip()
+        # Cap to a sane length so a paste of someone's whole bio doesn't end
+        # up in the greeting.
+        if len(cleaned) > 60:
+            cleaned = cleaned[:60]
+        self._config["user_name"] = cleaned
+        return self._save()
+
+    def get_anonymous_id(self) -> str:
+        """Get the anonymous telemetry ID, generating one if missing."""
+        anon_id = self._config.get("anonymous_id")
+        if not anon_id:
+            anon_id = str(uuid.uuid4())
+            self._config["anonymous_id"] = anon_id
+            self._save()
+        return anon_id
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a configuration value."""
+        return self._config.get(key, default)
+
+    def set(self, key: str, value: Any) -> bool:
+        """Set a configuration value and save."""
+        self._config[key] = value
+        return self._save()
+
+
+# Global config instance
+_config_instance: Optional[Config] = None
+
+
+def get_config() -> Config:
+    """Get the global config instance (singleton pattern)."""
+    global _config_instance
+    if _config_instance is None:
+        _config_instance = Config()
+    return _config_instance
+
+
+def get_data_dirs() -> Dict[str, Path]:
+    """
+    Centralised path resolution for recordings, transcripts, and output.
+
+    Returns dict with keys: recordings, transcripts, output.
+    Uses custom storage_path from config if set, otherwise falls back to
+    production (~/Library/Application Support/stenoai/) or development paths.
+    """
+    config = get_config()
+    custom = config.get_storage_path()
+
+    import sys as _sys
+    if custom:
+        base = Path(custom)
+    elif getattr(_sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
+        base = Path.home() / "Library" / "Application Support" / "stenoai"
+    else:
+        base = Path(__file__).parent.parent  # project root in dev (source)
+
+    dirs = {
+        "recordings": base / "recordings",
+        "transcripts": base / "transcripts",
+        "output": base / "output",
+    }
+
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    return dirs
