@@ -15,8 +15,25 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Ollama download URL for macOS
-OLLAMA_DOWNLOAD_URL = "https://github.com/ollama/ollama/releases/download/v0.16.3/ollama-darwin.tgz"
+OLLAMA_VERSION = "v0.17.5"
+
+
+def get_ollama_executable_name() -> str:
+    return "ollama.exe" if sys.platform == "win32" else "ollama"
+
+
+def get_ollama_download_filename() -> str:
+    if sys.platform == "darwin":
+        return "ollama-darwin.tgz"
+    if sys.platform == "win32":
+        return "ollama-windows-amd64.zip"
+    return "ollama-linux-amd64.tgz"
+
+
+OLLAMA_DOWNLOAD_URL = (
+    f"https://github.com/ollama/ollama/releases/download/{OLLAMA_VERSION}/"
+    f"{get_ollama_download_filename()}"
+)
 
 
 def get_bundled_ollama_dir() -> Optional[Path]:
@@ -42,7 +59,7 @@ def get_bundled_ollama_dir() -> Optional[Path]:
 
     # Development mode - check bin directory
     dev_ollama_dir = Path(__file__).parent.parent / 'bin'
-    if dev_ollama_dir.exists() and (dev_ollama_dir / 'ollama').exists():
+    if dev_ollama_dir.exists() and (dev_ollama_dir / get_ollama_executable_name()).exists():
         return dev_ollama_dir
 
     return None
@@ -62,23 +79,34 @@ def get_ollama_binary() -> Optional[Path]:
     # Check bundled first
     bundled_dir = get_bundled_ollama_dir()
     if bundled_dir:
-        ollama_path = bundled_dir / 'ollama'
+        ollama_path = bundled_dir / get_ollama_executable_name()
         if ollama_path.exists():
             logger.info(f"Using bundled Ollama: {ollama_path}")
             return ollama_path
 
     # Fall back to system Ollama
-    system_paths = [
-        '/opt/homebrew/bin/ollama',  # Homebrew on Apple Silicon
-        '/usr/local/bin/ollama',     # Homebrew on Intel
-        '/usr/bin/ollama',           # System installation
-    ]
+    if sys.platform == "darwin":
+        system_paths = [
+            '/opt/homebrew/bin/ollama',  # Homebrew on Apple Silicon
+            '/usr/local/bin/ollama',     # Homebrew on Intel
+            '/usr/bin/ollama',
+        ]
+    elif sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        system_paths = [
+            str(Path(local_app_data) / "Programs" / "Ollama" / "ollama.exe"),
+            str(Path(program_files) / "Ollama" / "ollama.exe"),
+        ]
+    else:
+        system_paths = ['/usr/local/bin/ollama', '/usr/bin/ollama']
 
     # Check PATH first
     try:
-        result = subprocess.run(['which', 'ollama'], capture_output=True, text=True, timeout=5)
+        finder = 'where' if sys.platform == 'win32' else 'which'
+        result = subprocess.run([finder, get_ollama_executable_name()], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            path = Path(result.stdout.strip())
+            path = Path(result.stdout.strip().splitlines()[0])
             if path.exists():
                 logger.info(f"Using system Ollama from PATH: {path}")
                 return path
@@ -109,20 +137,19 @@ def get_ollama_env() -> dict:
 
     bundled_dir = get_bundled_ollama_dir()
     if bundled_dir:
-        # Add bundled directory to library path for dylibs
         ollama_dir_str = str(bundled_dir)
 
-        # macOS uses DYLD_LIBRARY_PATH
-        existing = env.get('DYLD_LIBRARY_PATH', '')
-        if existing:
-            env['DYLD_LIBRARY_PATH'] = f"{ollama_dir_str}:{existing}"
+        if sys.platform == "darwin":
+            existing = env.get('DYLD_LIBRARY_PATH', '')
+            env['DYLD_LIBRARY_PATH'] = f"{ollama_dir_str}{os.pathsep}{existing}" if existing else ollama_dir_str
+            env['MLX_METAL_PATH'] = str(bundled_dir / 'mlx.metallib')
+            logger.debug(f"Set DYLD_LIBRARY_PATH: {env['DYLD_LIBRARY_PATH']}")
+        elif sys.platform == "win32":
+            existing = env.get('PATH', '')
+            env['PATH'] = f"{ollama_dir_str}{os.pathsep}{existing}" if existing else ollama_dir_str
         else:
-            env['DYLD_LIBRARY_PATH'] = ollama_dir_str
-
-        # Also set for Metal library
-        env['MLX_METAL_PATH'] = str(bundled_dir / 'mlx.metallib')
-
-        logger.debug(f"Set DYLD_LIBRARY_PATH: {env['DYLD_LIBRARY_PATH']}")
+            existing = env.get('LD_LIBRARY_PATH', '')
+            env['LD_LIBRARY_PATH'] = f"{ollama_dir_str}{os.pathsep}{existing}" if existing else ollama_dir_str
 
     return env
 
@@ -191,13 +218,17 @@ def start_ollama_server(wait: bool = True, timeout: int = 30) -> bool:
 
         # Start Ollama server in background
         logger.info(f"Starting Ollama server: {ollama_binary}")
-        proc = subprocess.Popen(
-            [str(ollama_binary), 'serve'],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True  # Detach from parent process
-        )
+        popen_kwargs = {
+            "env": env,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen([str(ollama_binary), 'serve'], **popen_kwargs)
         _write_pid(proc.pid)
 
         if not wait:

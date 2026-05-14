@@ -6,11 +6,30 @@ Handles storing and loading user preferences like model selection.
 
 import json
 import logging
+import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+
+def get_default_user_data_dir() -> Path:
+    """Return the platform-native per-user data directory for StenoAI."""
+    override = os.environ.get("STENOAI_USER_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "stenoai"
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "stenoai"
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home) / "stenoai"
+    return Path.home() / ".local" / "share" / "stenoai"
 
 
 class Config:
@@ -139,10 +158,8 @@ class Config:
             config_path: Path to config file. If None, uses default location.
         """
         if config_path is None:
-            import sys as _sys
-            if getattr(_sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
-                # Bundled (PyInstaller dev or production): ~/Library/Application Support/stenoai
-                base_dir = Path.home() / "Library" / "Application Support" / "stenoai"
+            if os.environ.get("STENOAI_USER_DATA_DIR") or getattr(sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
+                base_dir = get_default_user_data_dir()
             else:
                 # Source dev: project root
                 base_dir = Path(__file__).parent.parent
@@ -571,17 +588,16 @@ def get_data_dirs() -> Dict[str, Path]:
     Centralised path resolution for recordings, transcripts, and output.
 
     Returns dict with keys: recordings, transcripts, output.
-    Uses custom storage_path from config if set, otherwise falls back to
-    production (~/Library/Application Support/stenoai/) or development paths.
+    Uses custom storage_path from config if set, otherwise falls back to the
+    platform-native user data directory in production or development paths.
     """
     config = get_config()
     custom = config.get_storage_path()
 
-    import sys as _sys
     if custom:
         base = Path(custom)
-    elif getattr(_sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
-        base = Path.home() / "Library" / "Application Support" / "stenoai"
+    elif os.environ.get("STENOAI_USER_DATA_DIR") or getattr(sys, 'frozen', False) or "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
+        base = get_default_user_data_dir()
     else:
         base = Path(__file__).parent.parent  # project root in dev (source)
 

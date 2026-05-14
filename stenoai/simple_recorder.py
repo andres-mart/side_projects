@@ -1407,7 +1407,8 @@ def list_meetings():
     custom = get_config().get_storage_path()
     if custom:
         if "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
-            default_output = Path.home() / "Library" / "Application Support" / "stenoai" / "output"
+            from src.config import get_default_user_data_dir
+            default_output = get_default_user_data_dir() / "output"
         else:
             default_output = Path(__file__).parent / "output"
         if default_output.exists():
@@ -1980,7 +1981,8 @@ def list_failed():
     custom = get_config().get_storage_path()
     if custom:
         if "StenoAI.app" in str(Path(__file__)) or "Applications" in str(Path(__file__)):
-            default_output = Path.home() / "Library" / "Application Support" / "stenoai" / "output"
+            from src.config import get_default_user_data_dir
+            default_output = get_default_user_data_dir() / "output"
         else:
             default_output = Path(__file__).parent / "output"
         if default_output.exists():
@@ -2088,22 +2090,39 @@ def setup_check():
         ffmpeg_found = False
         possible_ffmpeg_paths = []
 
+        ffmpeg_names = ['ffmpeg.exe', 'ffmpeg'] if sys.platform == 'win32' else ['ffmpeg']
+
         # Check bundled ffmpeg (PyInstaller bundle)
         if getattr(sys, 'frozen', False):
             exe_dir = Path(sys.executable).parent
-            for candidate in [
-                exe_dir / 'ffmpeg',                    # bundle root (stenoai.spec places it at '.')
-                exe_dir / '_internal' / 'ffmpeg',      # _internal subdirectory
-            ]:
-                if candidate.exists():
-                    possible_ffmpeg_paths.append(('bundled', str(candidate)))
+            for name in ffmpeg_names:
+                for candidate in [
+                    exe_dir / name,                    # bundle root (stenoai.spec places it at '.')
+                    exe_dir / '_internal' / name,      # _internal subdirectory
+                ]:
+                    if candidate.exists():
+                        possible_ffmpeg_paths.append(('bundled', str(candidate)))
 
-        possible_ffmpeg_paths.extend([
-            (None, 'ffmpeg'),                          # PATH
-            (None, '/opt/homebrew/bin/ffmpeg'),         # Homebrew Apple Silicon
-            (None, '/usr/local/bin/ffmpeg'),            # Homebrew Intel
-            (None, '/usr/bin/ffmpeg'),                  # System
-        ])
+        possible_ffmpeg_paths.extend((None, name) for name in ffmpeg_names)
+        if sys.platform == 'darwin':
+            possible_ffmpeg_paths.extend([
+                (None, '/opt/homebrew/bin/ffmpeg'),     # Homebrew Apple Silicon
+                (None, '/usr/local/bin/ffmpeg'),        # Homebrew Intel
+                (None, '/usr/bin/ffmpeg'),              # System
+            ])
+        elif sys.platform == 'win32':
+            program_files = os.environ.get('ProgramFiles', r'C:\Program Files')
+            program_files_x86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+            possible_ffmpeg_paths.extend([
+                (None, str(Path(program_files) / 'ffmpeg' / 'bin' / 'ffmpeg.exe')),
+                (None, str(Path(program_files_x86) / 'ffmpeg' / 'bin' / 'ffmpeg.exe')),
+            ])
+        else:
+            possible_ffmpeg_paths.extend([
+                (None, '/usr/local/bin/ffmpeg'),
+                (None, '/usr/bin/ffmpeg'),
+                (None, '/snap/bin/ffmpeg'),
+            ])
 
         for label, path in possible_ffmpeg_paths:
             try:

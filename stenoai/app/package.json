@@ -19,6 +19,8 @@
     "build": "npm run build:renderer && electron-builder",
     "pack:unsigned": "npm run build:renderer && electron-builder --dir --config electron-builder.ci.yml",
     "build-mac": "npm run build:renderer && electron-builder --mac",
+    "build:win": "npm run build:renderer && electron-builder --win",
+    "build:linux": "npm run build:renderer && electron-builder --linux",
     "build:intel": "npm run build:renderer && electron-builder --mac --x64",
     "build:arm64": "npm run build:renderer && electron-builder --mac --arm64",
     "dist": "npm run build:renderer && electron-builder --publish=never",
@@ -152,6 +154,27 @@
         "NSScreenCaptureUsageDescription": "Steno needs screen capture access to record system audio on macOS versions older than 14.4.",
         "LSMinimumSystemVersion": "12.3.0"
       }
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "artifactName": "stenoAI-windows-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "tar.gz"
+      ],
+      "category": "Utility",
+      "artifactName": "stenoAI-linux-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
     },
     "dmg": {
       "title": "Steno Installer",

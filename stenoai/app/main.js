@@ -113,14 +113,66 @@ function registerShortcutProtocolClient() {
   return app.setAsDefaultProtocolClient(SHORTCUT_PROTOCOL);
 }
 
+function getBackendExecutableName() {
+  return process.platform === 'win32' ? 'stenoai.exe' : 'stenoai';
+}
+
+function getFfmpegExecutableName() {
+  return process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+}
+
+function getOllamaExecutableName() {
+  return process.platform === 'win32' ? 'ollama.exe' : 'ollama';
+}
+
+function getFfmpegCandidatePaths() {
+  const executable = getFfmpegExecutableName();
+  const bundled = app.isPackaged
+    ? path.join(process.resourcesPath, 'stenoai', executable)
+    : path.join(__dirname, '..', 'dist', 'stenoai', executable);
+  const paths = [bundled, executable];
+
+  if (process.platform === 'darwin') {
+    paths.push('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg');
+  } else if (process.platform === 'win32') {
+    paths.push(
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'ffmpeg', 'bin', 'ffmpeg.exe'),
+      path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'ffmpeg', 'bin', 'ffmpeg.exe'),
+    );
+  } else {
+    paths.push('/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg', '/snap/bin/ffmpeg');
+  }
+
+  return [...new Set(paths)];
+}
+
+function getBundledOllamaDir() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'stenoai', '_internal', 'ollama')
+    : path.join(__dirname, '..', 'bin');
+}
+
+function getBackendEnv(extraEnv = {}) {
+  return {
+    ...require('process').env,
+    STENOAI_USER_DATA_DIR: app.getPath('userData'),
+    ...extraEnv,
+  };
+}
+
+function getUserDataPath(...segments) {
+  return path.join(app.getPath('userData'), ...segments);
+}
+
 // Backend executable path - always use bundled stenoai
 function getBackendPath() {
+  const executable = getBackendExecutableName();
   if (app.isPackaged) {
     // Production: bundled in app resources
-    return path.join(process.resourcesPath, 'stenoai', 'stenoai');
+    return path.join(process.resourcesPath, 'stenoai', executable);
   } else {
     // Development: use local build
-    return path.join(__dirname, '..', 'dist', 'stenoai', 'stenoai');
+    return path.join(__dirname, '..', 'dist', 'stenoai', executable);
   }
 }
 
@@ -455,7 +507,7 @@ function getAllowedBaseDirs() {
   const projectRoot = path.join(__dirname, '..');
   const dirs = [
     projectRoot,
-    path.join(os.homedir(), 'Library', 'Application Support', 'stenoai')
+    app.getPath('userData')
   ];
   if (_cachedCustomStoragePath) {
     dirs.push(_cachedCustomStoragePath);
@@ -1003,7 +1055,7 @@ function runPythonScript(script, args = [], silent = false, extraEnv = {}) {
 
     const process = spawn(backendPath, args, {
       cwd: getBackendCwd(),
-      env: Object.keys(extraEnv).length > 0 ? { ...require('process').env, ...extraEnv } : undefined
+      env: getBackendEnv(extraEnv)
     });
 
     let stdout = '';
@@ -1188,12 +1240,12 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     sendDebugLog(`$ stenoai ${args.join(' ')}`);
 
     const cloudKey = loadCloudApiKey();
-    const reprocessEnv = cloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: cloudKey } : undefined;
+    const reprocessEnv = cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {};
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
         cwd: getBackendCwd(),
-        env: reprocessEnv
+        env: getBackendEnv(reprocessEnv)
       });
 
       let stderrBuf = '';
@@ -1271,12 +1323,12 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
 ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) => {
   try {
     const cloudKey = loadCloudApiKey();
-    const regenEnv = cloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: cloudKey } : undefined;
+    const regenEnv = cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {};
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), ['regen-title', summaryFile], {
         cwd: getBackendCwd(),
-        env: regenEnv,
+        env: getBackendEnv(regenEnv),
       });
 
       let stderrBuf = '';
@@ -1370,7 +1422,7 @@ ipcMain.on('query-transcript-stream', (event, queryId, summaryFile, question) =>
   console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query: ${question.substring(0, 50)}...`);
   const cloudKey = loadCloudApiKey();
-  const env = cloudKey ? { ...process.env, STENOAI_CLOUD_API_KEY: cloudKey } : process.env;
+  const env = getBackendEnv(cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {});
 
   let proc;
   try {
@@ -1461,7 +1513,7 @@ ipcMain.on('query-transcript-stream', (event, queryId, summaryFile, question) =>
 ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
   sendDebugLog(`💬 Global chat query: ${String(question || '').slice(0, 80)}... (folder: ${folderId || 'all'})`);
   const cloudKey = loadCloudApiKey();
-  const env = cloudKey ? { ...process.env, STENOAI_CLOUD_API_KEY: cloudKey } : process.env;
+  const env = getBackendEnv(cloudKey ? { STENOAI_CLOUD_API_KEY: cloudKey } : {});
 
   const args = ['chat-global-streaming', '-q', question];
   if (folderId && typeof folderId === 'string' && folderId !== 'all') {
@@ -1893,7 +1945,7 @@ ipcMain.handle('get-queue-status', async () => {
 function loadSystemAudioEnabled() {
   if (!isCoreAudioTapSupported()) return false;
   try {
-    const cfgPath = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'config.json');
+    const cfgPath = getUserDataPath('config.json');
     if (!fs.existsSync(cfgPath)) return true; // new install → CoreAudio default
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     // `false` only when the user has explicitly opted out; an absent key
@@ -1987,7 +2039,7 @@ async function processNextInQueue() {
   
   try {
     const queueCloudKey = loadCloudApiKey();
-    const queueEnv = queueCloudKey ? { ...require('process').env, STENOAI_CLOUD_API_KEY: queueCloudKey } : undefined;
+    const queueEnv = queueCloudKey ? { STENOAI_CLOUD_API_KEY: queueCloudKey } : {};
     const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
     if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
       processArgs.push('--notes', currentProcessingJob.notesFile);
@@ -1996,7 +2048,7 @@ async function processNextInQueue() {
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), processArgs, {
         cwd: getBackendCwd(),
-        env: queueEnv
+        env: getBackendEnv(queueEnv)
       });
 
       let stderrBuf = '';
@@ -2190,7 +2242,7 @@ ipcMain.handle('start-recording-ui', async (_, sessionName) => {
 
     currentRecordingProcess = spawn(getBackendPath(), ['record', '7200', actualSessionName], {
       cwd: getBackendCwd(),
-      env: Object.keys(recordEnv).length > 0 ? { ...require('process').env, ...recordEnv } : undefined
+      env: getBackendEnv(recordEnv)
     });
     currentRecordingSessionName = actualSessionName;
     startRecordingRuntimeState();
@@ -2513,15 +2565,13 @@ ipcMain.handle('setup-system-check', async () => {
       return { success: false, error: 'Python 3 not found. Please install Python 3.8+' };
     }
     
-    // Create required directories - match Python logic for DMG vs development
-    const os = require('os');
+    // Create required directories - match Python logic for production vs development
     const currentPath = __dirname;
     let baseDir;
     
     // Detect if running from app bundle (DMG install) or development
     if (currentPath.includes('StenoAI.app') || currentPath.includes('Applications')) {
-      // DMG/Production: Use Application Support folder
-      baseDir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai');
+      baseDir = app.getPath('userData');
     } else {
       // Development: Use project relative paths  
       baseDir = path.join(__dirname, '..');
@@ -2570,10 +2620,7 @@ ipcMain.handle('setup-ffmpeg', async () => {
     sendDebugLog('$ Checking for existing ffmpeg installation...');
 
     // Check bundled ffmpeg first (shipped with the app), then system paths
-    const bundledFfmpeg = app.isPackaged
-      ? path.join(process.resourcesPath, 'stenoai', 'ffmpeg')
-      : path.join(__dirname, '..', 'dist', 'stenoai', 'ffmpeg');
-    const ffmpegPaths = [bundledFfmpeg, 'ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+    const ffmpegPaths = getFfmpegCandidatePaths();
     sendDebugLog(`$ Checking: ${ffmpegPaths.join(', ')}`);
     let ffmpegPath = null;
 
@@ -2600,6 +2647,14 @@ ipcMain.handle('setup-ffmpeg', async () => {
       sendDebugLog('ffmpeg not found in any common locations');
     }
     
+    if (!ffmpegPath && process.platform !== 'darwin') {
+      const installHint = process.platform === 'win32'
+        ? 'Install ffmpeg for Windows and ensure ffmpeg.exe is on PATH, or use the bundled ffmpeg.exe.'
+        : 'Install ffmpeg with your distribution package manager and ensure it is on PATH, or use the bundled ffmpeg.';
+      sendDebugLog(installHint);
+      return { success: false, error: installHint };
+    }
+
     // Install ffmpeg if not present
     if (!ffmpegPath) {
       sendDebugLog('ffmpeg not found, checking for Homebrew...');
@@ -3240,7 +3295,7 @@ ipcMain.handle('get-storage-path', async () => {
     const customPath = jsonData.storage_path && jsonData.storage_path.trim()
       ? jsonData.storage_path
       : null;
-    const defaultPath = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai');
+    const defaultPath = app.getPath('userData');
     return {
       success: true,
       storage_path: customPath || defaultPath,
@@ -3748,7 +3803,7 @@ ipcMain.handle('set-user-name', async (event, name) => {
 // AI Provider IPC handlers
 
 function getCloudKeyPath() {
-  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.cloud-api-key');
+  return getUserDataPath('.cloud-api-key');
 }
 
 function saveCloudApiKey(key) {
@@ -3899,7 +3954,7 @@ ipcMain.handle('get-recordings-dir', async () => {
     if (jsonData.storage_path) {
       recordingsDir = path.join(jsonData.storage_path, 'recordings');
     } else if (app.isPackaged) {
-      recordingsDir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'recordings');
+      recordingsDir = getUserDataPath('recordings');
     } else {
       recordingsDir = path.join(__dirname, '..', 'recordings');
     }
@@ -3921,7 +3976,7 @@ ipcMain.handle('get-recordings-dir', async () => {
 // blob comes over IPC as a Uint8Array (structured-clone friendly).
 ipcMain.handle('write-system-audio-blob', async (_event, payload, sessionName) => {
   try {
-    const dir = path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', 'system_audio_tmp');
+    const dir = getUserDataPath('system_audio_tmp');
     fs.mkdirSync(dir, { recursive: true });
     const safeName = String(sessionName || 'Meeting').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
     const filename = `sysaudio-${Date.now()}-${safeName}.webm`;
@@ -4079,29 +4134,27 @@ ipcMain.handle('pull-model', async (event, modelName) => {
 
 // Helper to build env vars for running the bundled Ollama binary directly
 function getOllamaEnv() {
-  let ollamaDir;
-  if (app.isPackaged) {
-    ollamaDir = path.join(process.resourcesPath, 'stenoai', '_internal', 'ollama');
-  } else {
-    ollamaDir = path.join(__dirname, '..', 'bin');
-  }
+  const ollamaDir = getBundledOllamaDir();
   const env = { ...process.env };
-  const existing = env.DYLD_LIBRARY_PATH || '';
-  env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;
-  env.MLX_METAL_PATH = path.join(ollamaDir, 'mlx.metallib');
+
+  if (process.platform === 'darwin') {
+    const existing = env.DYLD_LIBRARY_PATH || '';
+    env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}${path.delimiter}${existing}` : ollamaDir;
+    env.MLX_METAL_PATH = path.join(ollamaDir, 'mlx.metallib');
+  } else if (process.platform === 'win32') {
+    const existing = env.Path || env.PATH || '';
+    env.Path = existing ? `${ollamaDir}${path.delimiter}${existing}` : ollamaDir;
+  } else {
+    const existing = env.LD_LIBRARY_PATH || '';
+    env.LD_LIBRARY_PATH = existing ? `${ollamaDir}${path.delimiter}${existing}` : ollamaDir;
+  }
+
   return env;
 }
 
 // Helper function to find Ollama executable (bundled only)
 async function findOllamaExecutable() {
-  let bundledOllamaPath;
-  if (app.isPackaged) {
-    // Production: bundled inside PyInstaller _internal directory
-    bundledOllamaPath = path.join(process.resourcesPath, 'stenoai', '_internal', 'ollama', 'ollama');
-  } else {
-    // Development: in project bin/ directory
-    bundledOllamaPath = path.join(__dirname, '..', 'bin', 'ollama');
-  }
+  const bundledOllamaPath = path.join(getBundledOllamaDir(), getOllamaExecutableName());
 
   if (fs.existsSync(bundledOllamaPath)) {
     console.log(`Using bundled Ollama: ${bundledOllamaPath}`);
@@ -4333,7 +4386,7 @@ ipcMain.handle('open-external', async (event, url) => {
 // ── Google Calendar: Token Storage ──────────────────────────────────────
 
 function getTokenFilePath() {
-  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.google-tokens');
+  return getUserDataPath('.google-tokens');
 }
 
 function saveGoogleTokens(tokens) {
@@ -4378,7 +4431,7 @@ function deleteGoogleTokens() {
 // ── Outlook Calendar: Token Storage ─────────────────────────────────────
 
 function getOutlookTokenFilePath() {
-  return path.join(os.homedir(), 'Library', 'Application Support', 'stenoai', '.outlook-tokens');
+  return getUserDataPath('.outlook-tokens');
 }
 
 function saveOutlookTokens(tokens) {

@@ -50,6 +50,43 @@ _FFMPEG_PATH_CACHE: Optional[str] = None
 _FFMPEG_PATH_LOCK = threading.Lock()
 
 
+def _ffmpeg_executable_names() -> list[str]:
+    return ['ffmpeg.exe', 'ffmpeg'] if sys.platform == 'win32' else ['ffmpeg']
+
+
+def _ffmpeg_candidate_paths() -> list[str]:
+    candidates: list[str] = []
+    names = _ffmpeg_executable_names()
+
+    if getattr(sys, 'frozen', False):
+        exe_dir = Path(sys.executable).parent
+        for name in names:
+            candidates.extend([
+                str(exe_dir / name),
+                str(exe_dir / '_internal' / name),
+            ])
+            if hasattr(sys, '_MEIPASS'):
+                candidates.append(str(Path(sys._MEIPASS) / name))
+    else:
+        for name in names:
+            candidates.append(str(Path(__file__).parent.parent / 'bin' / name))
+
+    candidates.extend(names)
+
+    if sys.platform == 'darwin':
+        candidates.extend(['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'])
+    elif sys.platform == 'win32':
+        program_files = os.environ.get('ProgramFiles', r'C:\Program Files')
+        candidates.extend([
+            str(Path(program_files) / 'ffmpeg' / 'bin' / 'ffmpeg.exe'),
+            str(Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'ffmpeg' / 'bin' / 'ffmpeg.exe'),
+        ])
+    else:
+        candidates.extend(['/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg', '/snap/bin/ffmpeg'])
+
+    return list(dict.fromkeys(candidates))
+
+
 def _resolve_ffmpeg() -> Optional[str]:
     global _FFMPEG_PATH_CACHE
     if _FFMPEG_PATH_CACHE is not None:
@@ -57,19 +94,7 @@ def _resolve_ffmpeg() -> Optional[str]:
     with _FFMPEG_PATH_LOCK:
         if _FFMPEG_PATH_CACHE is not None:
             return _FFMPEG_PATH_CACHE
-        candidates: list[str] = []
-        if getattr(sys, 'frozen', False):
-            exe_dir = Path(sys.executable).parent
-            candidates.extend([
-                str(exe_dir / 'ffmpeg'),
-                str(exe_dir / '_internal' / 'ffmpeg'),
-            ])
-        candidates.extend([
-            'ffmpeg',
-            '/opt/homebrew/bin/ffmpeg',
-            '/usr/local/bin/ffmpeg',
-            '/usr/bin/ffmpeg',
-        ])
+        candidates = _ffmpeg_candidate_paths()
         for cand in candidates:
             try:
                 r = subprocess.run([cand, '-version'], capture_output=True, timeout=5)
@@ -229,65 +254,13 @@ class WhisperTranscriber:
         Ensure ffmpeg is in PATH for audio processing.
         Checks bundled ffmpeg first, then system locations.
         """
-        import sys
-
-        # Build list of possible ffmpeg locations
-        possible_ffmpeg_paths = []
-
-        # Check bundled ffmpeg first (PyInstaller bundle)
-        if getattr(sys, 'frozen', False):
-            # Running from PyInstaller bundle
-            # stenoai.spec places ffmpeg at '.' (bundle root, next to executable)
-            exe_dir = Path(sys.executable).parent
-            root_ffmpeg = exe_dir / 'ffmpeg'
-            if root_ffmpeg.exists():
-                possible_ffmpeg_paths.append(str(root_ffmpeg))
-            # Also check _MEIPASS (_internal) in case layout changes
-            if hasattr(sys, '_MEIPASS'):
-                meipass_ffmpeg = Path(sys._MEIPASS) / 'ffmpeg'
-                if meipass_ffmpeg.exists():
-                    possible_ffmpeg_paths.append(str(meipass_ffmpeg))
-            # Also check _internal subdirectory
-            internal_ffmpeg = exe_dir / '_internal' / 'ffmpeg'
-            if internal_ffmpeg.exists():
-                possible_ffmpeg_paths.append(str(internal_ffmpeg))
-        else:
-            # Development mode - check bin directory
-            dev_ffmpeg = Path(__file__).parent.parent / 'bin' / 'ffmpeg'
-            if dev_ffmpeg.exists():
-                possible_ffmpeg_paths.append(str(dev_ffmpeg))
-
-        # Add system locations as fallback
-        possible_ffmpeg_paths.extend([
-            '/opt/homebrew/bin/ffmpeg',  # Homebrew on Apple Silicon
-            '/usr/local/bin/ffmpeg',     # Homebrew on Intel
-            '/usr/bin/ffmpeg',           # System installation
-        ])
-
-        # Check if ffmpeg is already in PATH
-        try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5, check=True)
-            logger.info("ffmpeg found in PATH")
-            return
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-            pass
-
-        # Try each possible location
-        ffmpeg_found_path = None
-        for ffmpeg_path in possible_ffmpeg_paths:
-            try:
-                subprocess.run([ffmpeg_path, '-version'], capture_output=True, timeout=5, check=True)
-                ffmpeg_found_path = ffmpeg_path
-                logger.info(f"Found ffmpeg at: {ffmpeg_path}")
-                break
-            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-                continue
+        ffmpeg_found_path = _resolve_ffmpeg()
 
         if ffmpeg_found_path:
             ffmpeg_dir = os.path.dirname(ffmpeg_found_path)
             current_path = os.environ.get('PATH', '')
             if ffmpeg_dir not in current_path:
-                os.environ['PATH'] = f"{ffmpeg_dir}:{current_path}"
+                os.environ['PATH'] = f"{ffmpeg_dir}{os.pathsep}{current_path}"
                 logger.info(f"Added {ffmpeg_dir} to PATH")
         else:
             logger.warning("ffmpeg not found - transcription may fail")
