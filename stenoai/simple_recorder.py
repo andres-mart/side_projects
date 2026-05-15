@@ -28,9 +28,11 @@ from typing import Optional
 
 # Import modules with graceful fallback for missing dependencies
 try:
-    from src.audio_recorder import AudioRecorder
+    from src.audio_recorder import AudioRecorder, SystemAudioRecorder, find_system_audio_device
 except ImportError:
     AudioRecorder = None
+    SystemAudioRecorder = None
+    find_system_audio_device = None
 
 try:
     from src.transcriber import WhisperTranscriber  
@@ -49,9 +51,15 @@ logger = logging.getLogger(__name__)
 class SimpleRecorder:
     """Simple audio recorder and transcriber."""
     
-    def __init__(self):
+    def __init__(self, system_audio: bool = False):
         # Only initialize if dependencies are available
-        self.audio_recorder = AudioRecorder() if AudioRecorder else None
+        self.system_audio = system_audio
+        if system_audio and SystemAudioRecorder:
+            self.audio_recorder = SystemAudioRecorder()
+        elif system_audio:
+            raise RuntimeError("System audio recording dependencies are not available")
+        else:
+            self.audio_recorder = AudioRecorder() if AudioRecorder else None
 
         # Only initialize transcriber/summarizer when needed to save memory
         self.transcriber = None
@@ -1039,17 +1047,19 @@ def status():
 @cli.command()
 @click.argument('duration', type=int, default=10)
 @click.argument('session_name', default='Recording')
-def record(duration, session_name):
+@click.option('--system-audio', is_flag=True, help='Record microphone and system loopback/monitor audio as stereo')
+def record(duration, session_name, system_audio):
     """Record audio for specified duration and process it"""
     import signal
     import sys
 
     print(f"🎤 Recording {duration} seconds of audio for '{session_name}'...")
 
-    recorder = SimpleRecorder()
+    recorder = SimpleRecorder(system_audio=system_audio)
     recording_path = None
     recording_started = False
     is_paused = False
+    stop_requested = False
 
     def pause_handler(signum, frame):
         """Handle SIGUSR1 to pause recording"""
@@ -1091,6 +1101,8 @@ def record(duration, session_name):
 
     def signal_handler(signum, frame):
         """Handle SIGTERM gracefully by stopping recording and processing"""
+        nonlocal stop_requested
+        stop_requested = True
         print(f"\n🛑 Received termination signal ({signum})")
         if recording_started and recorder:
             print("⏹️ Stopping recording and starting processing pipeline...")
@@ -1143,10 +1155,26 @@ def record(duration, session_name):
         
         print("🏁 Recording session ended - process complete")
         sys.exit(0)
-    
+    def stdin_stop_listener():
+        """Cross-platform graceful stop path used by Electron on Windows."""
+        nonlocal stop_requested
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() in {'stop', 'quit', 'exit'}:
+                    print("Received stdin stop request")
+                    stop_requested = True
+                    break
+        except Exception:
+            pass
+
     # Register signal handlers
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
+    try:
+        import threading
+        threading.Thread(target=stdin_stop_listener, daemon=True).start()
+    except Exception:
+        pass
     
     try:
         # Start recording
@@ -1159,13 +1187,15 @@ def record(duration, session_name):
         if duration > 86400:  # More than a day
             print("🔄 Recording indefinitely (until stopped)...")
             try:
-                while True:
+                while not stop_requested:
                     time.sleep(5)  # Check every 5 seconds
             except KeyboardInterrupt:
                 signal_handler(signal.SIGINT, None)
         else:
             # Count down for normal durations (log every 10 minutes to reduce spam)
             for i in range(duration, 0, -1):
+                if stop_requested:
+                    break
                 if i % 600 == 0:  # Every 10 minutes
                     print(f"Recording... {i // 60} minutes remaining")
                 time.sleep(1)
@@ -2454,6 +2484,63 @@ def get_system_audio():
     enabled = config.get_system_audio_enabled()
 
     print(json.dumps({"system_audio_enabled": enabled}))
+
+
+@cli.command(name='detect-system-audio')
+def detect_system_audio():
+    """Detect whether backend system audio capture is available."""
+    import sys as _sys
+
+    if _sys.platform == 'darwin':
+        print(json.dumps({
+            "supported": False,
+            "capture_mode": "renderer",
+            "reason": "macOS system audio is handled by Electron Core Audio capture",
+        }))
+        return
+
+    if find_system_audio_device is None:
+        print(json.dumps({
+            "supported": False,
+            "capture_mode": "backend",
+            "reason": "sounddevice is not available",
+        }))
+        return
+
+    try:
+        device = find_system_audio_device()
+        if device is None:
+            hint = (
+                "No WASAPI output device found"
+                if _sys.platform == 'win32'
+                else "No PulseAudio/PipeWire monitor input found"
+            )
+            print(json.dumps({
+                "supported": False,
+                "capture_mode": "backend",
+                "reason": hint,
+            }))
+            return
+
+        try:
+            import sounddevice as _sd
+            info = _sd.query_devices(device)
+            device_name = info.get('name', str(device)) if isinstance(info, dict) else str(info)
+        except Exception:
+            device_name = str(device)
+
+        print(json.dumps({
+            "supported": True,
+            "capture_mode": "backend",
+            "device": device,
+            "device_name": device_name,
+        }))
+    except Exception as e:
+        print(json.dumps({
+            "supported": False,
+            "capture_mode": "backend",
+            "reason": str(e),
+        }))
 
 
 @cli.command()

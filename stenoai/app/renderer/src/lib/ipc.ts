@@ -315,7 +315,14 @@ export interface StenoaiBridge {
     disableLoopbackAudio: RequestFn<[], void>;
     getSystemAudioSupport: RequestFn<
       [],
-      Result<{ supported: boolean; osVersion: string; screenPermission: string }>
+      Result<{
+        supported: boolean;
+        captureMode: 'renderer' | 'backend' | 'none';
+        osVersion: string;
+        screenPermission: string;
+        reason?: string;
+        deviceName?: string;
+      }>
     >;
     writeSystemAudioBlob: RequestFn<
       [bytes: Uint8Array, name: string],

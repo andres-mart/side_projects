@@ -1027,14 +1027,27 @@ ipcMain.handle('request-microphone-permission', async () => {
 // than letting the user produce silent recordings.
 ipcMain.handle('get-system-audio-support', async () => {
   try {
-    const supported = isCoreAudioTapSupported();
+    let supported = isCoreAudioTapSupported();
+    let captureMode = supported ? 'renderer' : 'none';
+    let reason = '';
+    let deviceName = '';
     let screenPermission = 'unknown';
     let osVersion = '';
     if (process.platform === 'darwin') {
       try { osVersion = process.getSystemVersion(); } catch (_) {}
       try { screenPermission = systemPreferences.getMediaAccessStatus('screen'); } catch (_) {}
+    } else {
+      const result = await runPythonScript('simple_recorder.py', ['detect-system-audio'], true);
+      const jsonMatch = result.match(/\{.*\}/s);
+      if (jsonMatch) {
+        const detected = JSON.parse(jsonMatch[0]);
+        supported = Boolean(detected.supported);
+        captureMode = detected.capture_mode || (supported ? 'backend' : 'none');
+        reason = detected.reason || '';
+        deviceName = detected.device_name || '';
+      }
     }
-    return { success: true, supported, osVersion, screenPermission };
+    return { success: true, supported, captureMode, osVersion, screenPermission, reason, deviceName };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1943,10 +1956,10 @@ ipcMain.handle('get-queue-status', async () => {
 // default (currently true on a missing/empty config) when the OS does
 // support CoreAudio Tap so new installs get system audio out of the box.
 function loadSystemAudioEnabled() {
-  if (!isCoreAudioTapSupported()) return false;
+  if (process.platform === 'darwin' && !isCoreAudioTapSupported()) return false;
   try {
     const cfgPath = getUserDataPath('config.json');
-    if (!fs.existsSync(cfgPath)) return true; // new install → CoreAudio default
+    if (!fs.existsSync(cfgPath)) return process.platform === 'darwin';
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     // `false` only when the user has explicitly opted out; an absent key
     // means "haven't been asked yet" → treat as the new default.
@@ -1954,6 +1967,17 @@ function loadSystemAudioEnabled() {
   } catch (_) {
     return false;
   }
+}
+
+function getSystemAudioCaptureMode() {
+  if (!loadSystemAudioEnabled()) return 'disabled';
+  if (process.platform === 'darwin') {
+    return isCoreAudioTapSupported() ? 'renderer' : 'disabled';
+  }
+  if (process.platform === 'win32' || process.platform === 'linux') {
+    return 'backend';
+  }
+  return 'disabled';
 }
 
 // Global recording state management
@@ -2209,7 +2233,8 @@ ipcMain.handle('start-recording-ui', async (_, sessionName) => {
     // subprocess here or we'd produce two parallel recordings → two notes.
     // The renderer will write its mixed WebM and queue it through the
     // existing process-system-audio-recording IPC.
-    if (loadSystemAudioEnabled()) {
+    const systemAudioCaptureMode = getSystemAudioCaptureMode();
+    if (systemAudioCaptureMode === 'renderer') {
       sendDebugLog(`Starting renderer-driven recording (system audio mode): ${actualSessionName}`);
       currentRecordingSessionName = actualSessionName;
       startRecordingRuntimeState();
@@ -2240,7 +2265,13 @@ ipcMain.handle('start-recording-ui', async (_, sessionName) => {
     const cloudKey = loadCloudApiKey();
     if (cloudKey) recordEnv.STENOAI_CLOUD_API_KEY = cloudKey;
 
-    currentRecordingProcess = spawn(getBackendPath(), ['record', '7200', actualSessionName], {
+    const recordArgs = ['record', '7200', actualSessionName];
+    if (systemAudioCaptureMode === 'backend') {
+      recordArgs.push('--system-audio');
+      sendDebugLog('Using backend system-audio capture');
+    }
+
+    currentRecordingProcess = spawn(getBackendPath(), recordArgs, {
       cwd: getBackendCwd(),
       env: getBackendEnv(recordEnv)
     });
@@ -2482,8 +2513,14 @@ ipcMain.handle('stop-recording-ui', async () => {
 
     console.log('Stopping recording process...');
 
-    // Send SIGTERM to trigger graceful stop and processing
-    currentRecordingProcess.kill('SIGTERM');
+    // Send a graceful stop request. Windows does not deliver SIGTERM to
+    // Python, so stdin is the cross-platform stop path there.
+    if (process.platform === 'win32' && currentRecordingProcess.stdin) {
+      currentRecordingProcess.stdin.write('stop\n');
+      currentRecordingProcess.stdin.end();
+    } else {
+      currentRecordingProcess.kill('SIGTERM');
+    }
 
     // Don't wait - let the process complete independently
     // The process will handle: stop recording → transcribe → summarize → exit

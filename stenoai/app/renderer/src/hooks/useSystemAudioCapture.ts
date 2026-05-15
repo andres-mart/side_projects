@@ -31,7 +31,9 @@ export function useSystemAudioCapture() {
   // supported so a fast user who hits record before the IPC resolves still
   // gets system audio. The result-aware false case only fires after the
   // query has confirmed the OS is unsupported.
-  const enabled = (systemAudio.data ?? false) && (systemAudioSupport.data?.supported ?? true);
+  const enabled = (systemAudio.data ?? false)
+    && (systemAudioSupport.data?.supported ?? true)
+    && (systemAudioSupport.data?.captureMode ?? 'renderer') === 'renderer';
 
   const recorderRef = React.useRef<MediaRecorder | null>(null);
   const micStreamRef = React.useRef<MediaStream | null>(null);

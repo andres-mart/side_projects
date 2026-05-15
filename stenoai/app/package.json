@@ -160,6 +160,7 @@
         "nsis",
         "zip"
       ],
+      "signAndEditExecutable": false,
       "artifactName": "stenoAI-windows-${version}-${arch}.${ext}"
     },
     "linux": {

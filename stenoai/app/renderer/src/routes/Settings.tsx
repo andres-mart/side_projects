@@ -668,8 +668,10 @@ function GeneralTab() {
         label="Record system audio"
         description={
           systemAudioSupport.data && !systemAudioSupport.data.supported
-            ? `Capture audio from virtual meetings (requires macOS 14.4+, you're on ${systemAudioSupport.data.osVersion || 'an older version'})`
-            : 'Capture audio from virtual meetings (requires macOS 14.4+)'
+            ? (systemAudioSupport.data.reason || `Capture audio from virtual meetings (requires macOS 14.4+, you're on ${systemAudioSupport.data.osVersion || 'an older version'})`)
+            : systemAudioSupport.data?.captureMode === 'backend'
+              ? `Capture audio from virtual meetings${systemAudioSupport.data.deviceName ? ` via ${systemAudioSupport.data.deviceName}` : ''}`
+              : 'Capture audio from virtual meetings (requires macOS 14.4+)'
         }
       >
         <Switch

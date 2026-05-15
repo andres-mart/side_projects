@@ -1,0 +1,93 @@
+name: Cross-platform Build Smoke Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev portaudio19-dev ffmpeg
+
+      - name: Install Windows ffmpeg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg -y
+
+      - name: Install Python dependencies
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/build-constraints.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download bundled Ollama
+        shell: bash
+        run: |
+          chmod +x scripts/download-ollama.sh
+          ./scripts/download-ollama.sh
+
+      - name: Copy system ffmpeg into bin when script did not bundle it
+        shell: bash
+        run: |
+          mkdir -p bin
+          if [[ "$RUNNER_OS" == "Windows" && ! -f bin/ffmpeg.exe ]]; then
+            cp "$(command -v ffmpeg)" bin/ffmpeg.exe
+          elif [[ "$RUNNER_OS" != "Windows" && ! -f bin/ffmpeg ]]; then
+            cp "$(command -v ffmpeg)" bin/ffmpeg
+            chmod +x bin/ffmpeg
+          fi
+
+      - name: Build Python backend with PyInstaller
+        run: pyinstaller stenoai.spec --noconfirm
+
+      - name: Install Electron dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Typecheck renderer
+        working-directory: app
+        run: npm run typecheck:renderer
+
+      - name: Package Electron app directory
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run pack
+
+      - name: Upload packaged app
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          path: app/dist/
+          retention-days: 7
